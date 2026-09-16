@@ -86,5 +86,11 @@ The preceding `include_directories(${JSON_INCLUDE_DIRS})` and existing
 The build wrapper applies the patch to the extracted working copy and never
 modifies the archived upstream source.
 
+The ZIP also contains five pre-generated gengetopt C files whose header includes
+refer to the original author's absolute `/home/qwerty/...` build path. The
+matching generated headers are present in the same source directory, so
+`patches/0002-gengetopt-relative-includes.patch` changes only those five includes
+to `"zopt.h"`, `"topt.h"`, `"zbopt.h"`, `"zitopt.h"`, and `"ztopt.h"`.
+
 The ceiling is deliberate: no package framework, generic plug-in loader,
 database, workflow engine, or policy state machine is introduced in this slice.

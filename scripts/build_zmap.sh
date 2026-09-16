@@ -5,6 +5,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "$script_dir/.." && pwd)"
 archive="$project_dir/vendor/aim_zmap_reqnr_single.zip"
 compatibility_patch="$project_dir/patches/0001-cmake-json-c-flags.patch"
+generated_source_patch="$project_dir/patches/0002-gengetopt-relative-includes.patch"
 work_dir="$project_dir/.build"
 source_dir="$work_dir/aim_zmap_reqnr_single"
 build_dir="$work_dir/zmap-build"
@@ -40,6 +41,17 @@ if grep -Fq 'set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${JSON_CFLAGS}")' "$source_dir/
     patch --directory="$source_dir" --strip=1 < "$compatibility_patch"
 elif ! grep -Fq 'include_directories(${JSON_INCLUDE_DIRS})' "$source_dir/CMakeLists.txt"; then
     echo "unexpected upstream CMakeLists.txt; refusing to apply compatibility patch" >&2
+    exit 1
+fi
+
+# The ZIP also contains gengetopt output with the author's absolute build path
+# embedded in five #include directives. Replace only those includes; the
+# generated C and header contents otherwise remain untouched.
+if grep -Rq '#include "/home/qwerty/' "$source_dir/src"; then
+    patch --directory="$source_dir" --strip=1 < "$generated_source_patch"
+elif [[ "$(grep -El '^#include "(zopt|topt|zbopt|zitopt|ztopt)\.h"$' \
+        "$source_dir"/src/{zopt,topt,zbopt,zitopt,ztopt}.c | wc -l)" -ne 5 ]]; then
+    echo "unexpected generated option sources; refusing to apply path patch" >&2
     exit 1
 fi
 
