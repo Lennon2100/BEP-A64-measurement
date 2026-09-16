@@ -35,12 +35,14 @@ On Debian/Ubuntu, install the upstream build dependencies:
 
 ```bash
 sudo apt-get install build-essential cmake libgmp-dev gengetopt \
-  libpcap-dev flex byacc libjson-c-dev pkg-config libunistring-dev unzip
+  libpcap-dev flex byacc libjson-c-dev pkg-config libunistring-dev unzip patch
 chmod +x scripts/*.sh
 ./scripts/build_zmap.sh
 ```
 
 The script prints the resulting `zmap` path. It does not install system-wide.
+It also applies the single compatibility patch under `patches/` to the extracted
+build tree; the vendored ZIP remains byte-for-byte unchanged.
 
 ## Scan wrapper
 

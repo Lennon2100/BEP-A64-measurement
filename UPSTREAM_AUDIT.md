@@ -73,6 +73,18 @@ before reading it.
 4. Later, after data collection requires them, separate parsing and evaluation
    scripts that never modify raw ZMap output.
 
+### Modern CMake compatibility patch
+
+Ubuntu with modern CMake/pkg-config exposes `JSON_CFLAGS` as a semicolon-separated
+CMake list. The old upstream line that appends this list to the string-valued
+`CMAKE_C_FLAGS` turns those semicolons into shell command separators, producing
+`cc: fatal error: no input files` and `-I/usr/include/json-c: not found`.
+
+`patches/0001-cmake-json-c-flags.patch` removes only that redundant assignment.
+The preceding `include_directories(${JSON_INCLUDE_DIRS})` and existing
+`${JSON_LIBRARIES}` linkage already provide the required json-c build settings.
+The build wrapper applies the patch to the extracted working copy and never
+modifies the archived upstream source.
+
 The ceiling is deliberate: no package framework, generic plug-in loader,
 database, workflow engine, or policy state machine is introduced in this slice.
-
