@@ -2,29 +2,36 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-    echo "usage: $0 <bview.gz> <output.csv>" >&2
+    echo "usage: $0 <RIS RIB directory> <output.csv>" >&2
     exit 2
 fi
 
-rib_file="$1"
+rib_dir="$1"
 output_file="$2"
 
-for command_name in bgpdump gzip awk sort; do
+for command_name in bgpdump gzip awk sort find; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
     }
 done
 
-[[ -f "$rib_file" ]] || {
-    echo "RIB file does not exist: $rib_file" >&2
+[[ -d "$rib_dir" ]] || {
+    echo "RIS RIB directory does not exist: $rib_dir" >&2
     exit 1
 }
 
-gzip --test "$rib_file"
-
 [[ ! -e "$output_file" ]] || {
     echo "refusing to overwrite existing prefix output: $output_file" >&2
+    exit 1
+}
+
+mapfile -d '' rib_files < <(
+    find "$rib_dir" -maxdepth 1 -type f -name 'rrc*-latest-bview.gz' -print0 | sort -z
+)
+
+[[ ${#rib_files[@]} -gt 0 ]] || {
+    echo "no rrc*-latest-bview.gz files found in: $rib_dir" >&2
     exit 1
 }
 
@@ -32,32 +39,39 @@ mkdir -p "$(dirname -- "$output_file")"
 work_dir="$(mktemp -d "$(dirname -- "$output_file")/.extract-ris.XXXXXX")"
 trap 'rm -rf -- "$work_dir"' EXIT
 
-mrt_file="$work_dir/bview.mrt"
-prefix_file="$work_dir/ipv6-prefixes.csv"
+all_rows="$work_dir/all-ipv6-prefixes.csv"
+: > "$all_rows"
 
-gzip --decompress --stdout "$rib_file" > "$mrt_file"
+for rib_file in "${rib_files[@]}"; do
+    collector="$(basename -- "$rib_file")"
+    collector="${collector%%-*}"
+    mrt_file="$work_dir/${collector}.mrt"
 
-# bgpdump -m uses | separated fields. Field 6 is the announced prefix and
-# field 7 is the AS path. Preserve the rightmost AS-path token as origin
-# metadata; routed-union normalization and the /64 cutoff belong to the later
-# frame-preparation step.
-bgpdump -m "$mrt_file" \
-    | awk -F '|' '
-        index($6, ":") > 0 {
-            prefix = $6
-            path = $7
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
-            count = split(path, parts, /[[:space:]]+/)
-            origin = count > 0 ? parts[count] : ""
-            print prefix "," origin
-        }
-    ' \
-    | LC_ALL=C sort -u > "$prefix_file"
+    printf 'extracting %s\n' "$collector"
+    gzip --decompress --stdout "$rib_file" > "$mrt_file"
+
+    # bgpdump -m field 6 is the announced prefix and field 7 is the AS path.
+    # A colon in the prefix selects IPv6 and excludes all IPv4 rows. The
+    # rightmost AS-path token is retained as origin-AS metadata.
+    bgpdump -m "$mrt_file" \
+        | awk -F '|' '
+            index($6, ":") > 0 {
+                prefix = $6
+                path = $7
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", path)
+                count = split(path, parts, /[[:space:]]+/)
+                origin = count > 0 ? parts[count] : ""
+                print prefix "," origin
+            }
+        ' >> "$all_rows"
+
+    rm -- "$mrt_file"
+done
 
 {
     printf '# prefix,origin_asn\n'
-    cat "$prefix_file"
+    LC_ALL=C sort -u "$all_rows"
 } > "$output_file"
 
-printf 'extracted IPv6 prefix/origin rows: %s\n' "$(wc -l < "$prefix_file")"
-printf 'output: %s\n' "$output_file"
+row_count="$(awk 'END {print NR - 1}' "$output_file")"
+printf 'wrote %s unique IPv6 prefix/origin rows to %s\n' "$row_count" "$output_file"

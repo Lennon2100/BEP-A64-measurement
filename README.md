@@ -22,10 +22,10 @@ plug-in framework is built before two real strategies require shared code.
 - `vendor/aim_zmap_reqnr_single.zip`: the exact single-instance ZMap archive
   published inside the paper artifact.
 - `scripts/build_zmap.sh`: verifies and builds that archive on Linux.
-- `scripts/download_ris.sh`: downloads one explicit RIPE RIS RIB and records
-  its source URL and SHA-256 checksum.
-- `scripts/extract_ris_prefixes.sh`: calls `bgpdump` and extracts deduplicated
-  IPv6 `prefix,origin_asn` rows.
+- `scripts/download_ris.sh`: downloads `latest-bview.gz` from every active RIPE
+  RIS collector.
+- `scripts/extract_ris_prefixes.sh`: calls `bgpdump` for every downloaded RIB,
+  drops IPv4, and merges deduplicated IPv6 `prefix,origin_asn` rows.
 - `scripts/run_scan.sh`: a strict, non-interactive wrapper around
   `icmp6_echoscan_time`.
 - `strategies/README.md`: the minimal target-producer contract.
@@ -80,31 +80,23 @@ sudo apt-get install -y curl gzip bgpdump
 chmod +x scripts/*.sh
 ```
 
-For exploratory work, the original BValue-style moving snapshot can be fetched
-explicitly:
+Download the latest RIB from every currently active RIPE RIS collector:
 
 ```bash
-./scripts/download_ris.sh \
-  https://data.ris.ripe.net/rrc00/latest-bview.gz \
-  data/raw/ris/rrc00-latest-bview.gz
+./scripts/download_ris.sh data/raw/ris/latest
 ```
 
-For a recorded experiment, replace that URL with one immutable dated `bview`
-from the RIPE RIS archive, for example the following URL shape:
-
-```text
-https://data.ris.ripe.net/rrcXX/YYYY.MM/bview.YYYYMMDD.HHmm.gz
-```
-
-Extract IPv6 prefixes and origin metadata without overwriting an existing
-result:
+Decompress each RIB, run `bgpdump`, discard IPv4 rows, then merge and deduplicate
+IPv6 prefix/origin pairs:
 
 ```bash
 ./scripts/extract_ris_prefixes.sh \
-  data/raw/ris/rrc00-latest-bview.gz \
+  data/raw/ris/latest \
   data/interim/ris_ipv6_prefixes.csv
 ```
 
-The extractor deliberately does not decide the routed union, discard prefixes
-longer than `/64`, create PSUs, or sample A64s. Those are responsibilities of
-the later `prepare_pilot.py`, so the downloaded evidence remains reusable.
+The scripts intentionally match the original BValue collection style: they use
+the moving `latest-bview.gz` files from all collectors and do not create URL or
+checksum sidecars. The extractor does not yet compute the routed union, discard
+prefixes longer than `/64`, create PSUs, or sample A64s. Those remain
+responsibilities of the later `prepare_pilot.py`.

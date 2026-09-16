@@ -1,52 +1,56 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-    echo "usage: $0 <RIS bview URL> [output.gz]" >&2
+if [[ $# -gt 1 ]]; then
+    echo "usage: $0 [output-directory]" >&2
     exit 2
 fi
 
-ris_url="$1"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "$script_dir/.." && pwd)"
-output_file="${2:-$project_dir/data/raw/ris/$(basename -- "${ris_url%%\?*}")}"
+output_dir="${1:-$project_dir/data/raw/ris/latest}"
 
-for command_name in curl gzip sha256sum; do
+for command_name in curl find; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 1
     }
 done
 
-[[ "$ris_url" == https://data.ris.ripe.net/* ]] || {
-    echo "expected an HTTPS RIPE RIS URL under data.ris.ripe.net" >&2
+if [[ -d "$output_dir" && -n "$(find "$output_dir" -mindepth 1 -print -quit)" ]]; then
+    echo "refusing to mix a new download with existing files: $output_dir" >&2
     exit 1
-}
+fi
 
-[[ "$output_file" == *.gz ]] || {
-    echo "output path must end in .gz: $output_file" >&2
-    exit 1
-}
+mkdir -p "$output_dir"
 
-for reserved_path in "$output_file" "$output_file.url" "$output_file.sha256"; do
-    [[ ! -e "$reserved_path" ]] || {
-        echo "refusing to overwrite existing output: $reserved_path" >&2
+# Active collectors on the RIPE RIS collector page when this script was added.
+# RRC02, RRC08, and RRC09 are historical; RRC17 is not assigned.
+collectors=(
+    rrc00 rrc01 rrc03 rrc04 rrc05 rrc06 rrc07
+    rrc10 rrc11 rrc12 rrc13 rrc14 rrc15 rrc16
+    rrc18 rrc19 rrc20 rrc21 rrc22 rrc23 rrc24 rrc25 rrc26
+)
+
+partial_file=""
+trap '[[ -z "$partial_file" ]] || rm -f -- "$partial_file"' EXIT
+
+for collector in "${collectors[@]}"; do
+    output_file="$output_dir/${collector}-latest-bview.gz"
+    partial_file="$output_file.part"
+    url="https://data.ris.ripe.net/${collector}/latest-bview.gz"
+
+    [[ ! -e "$output_file" && ! -e "$partial_file" ]] || {
+        echo "refusing to overwrite existing collector data: $output_file" >&2
         exit 1
     }
+
+    printf 'downloading %s\n' "$collector"
+    curl --fail --location --retry 3 --output "$partial_file" "$url"
+    mv -- "$partial_file" "$output_file"
+    partial_file=""
 done
 
-mkdir -p "$(dirname -- "$output_file")"
-partial_file="$output_file.part"
-trap 'rm -f -- "$partial_file"' EXIT
-
-curl --fail --location --retry 3 --output "$partial_file" "$ris_url"
-gzip --test "$partial_file"
-mv -- "$partial_file" "$output_file"
 trap - EXIT
 
-printf '%s\n' "$ris_url" > "$output_file.url"
-sha256sum "$output_file" > "$output_file.sha256"
-
-printf 'downloaded: %s\n' "$output_file"
-printf 'source URL: %s\n' "$output_file.url"
-printf 'checksum:   %s\n' "$output_file.sha256"
+printf 'downloaded %s RIS collector RIBs to %s\n' "${#collectors[@]}" "$output_dir"
