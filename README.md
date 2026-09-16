@@ -22,6 +22,10 @@ plug-in framework is built before two real strategies require shared code.
 - `vendor/aim_zmap_reqnr_single.zip`: the exact single-instance ZMap archive
   published inside the paper artifact.
 - `scripts/build_zmap.sh`: verifies and builds that archive on Linux.
+- `scripts/download_ris.sh`: downloads one explicit RIPE RIS RIB and records
+  its source URL and SHA-256 checksum.
+- `scripts/extract_ris_prefixes.sh`: calls `bgpdump` and extracts deduplicated
+  IPv6 `prefix,origin_asn` rows.
 - `scripts/run_scan.sh`: a strict, non-interactive wrapper around
   `icmp6_echoscan_time`.
 - `strategies/README.md`: the minimal target-producer contract.
@@ -66,3 +70,41 @@ overwrite an existing raw result.
 The Windows checkout cannot compile or execute this packet engine. Final build
 and runtime verification therefore happens after this directory is copied to the
 Linux measurement server.
+
+## RIPE RIS input
+
+Install the small extraction toolchain on Debian/Ubuntu:
+
+```bash
+sudo apt-get install -y curl gzip bgpdump
+chmod +x scripts/*.sh
+```
+
+For exploratory work, the original BValue-style moving snapshot can be fetched
+explicitly:
+
+```bash
+./scripts/download_ris.sh \
+  https://data.ris.ripe.net/rrc00/latest-bview.gz \
+  data/raw/ris/rrc00-latest-bview.gz
+```
+
+For a recorded experiment, replace that URL with one immutable dated `bview`
+from the RIPE RIS archive, for example the following URL shape:
+
+```text
+https://data.ris.ripe.net/rrcXX/YYYY.MM/bview.YYYYMMDD.HHmm.gz
+```
+
+Extract IPv6 prefixes and origin metadata without overwriting an existing
+result:
+
+```bash
+./scripts/extract_ris_prefixes.sh \
+  data/raw/ris/rrc00-latest-bview.gz \
+  data/interim/ris_ipv6_prefixes.csv
+```
+
+The extractor deliberately does not decide the routed union, discard prefixes
+longer than `/64`, create PSUs, or sample A64s. Those are responsibilities of
+the later `prepare_pilot.py`, so the downloaded evidence remains reusable.
