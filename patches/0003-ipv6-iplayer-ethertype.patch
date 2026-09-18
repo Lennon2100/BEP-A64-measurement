@@ -1,0 +1,12 @@
+--- a/src/send-linux.h
++++ b/src/send-linux.h
+@@ -41,7 +41,8 @@
+ 	sockaddr.sll_ifindex = ifindex;
+ 	sockaddr.sll_halen = ETH_ALEN;
+ 	if (zconf.send_ip_pkts) {
+-		sockaddr.sll_protocol = htons(ETHERTYPE_IP);
++		sockaddr.sll_protocol = htons(zconf.ipv6_source_ip ?
++					 ETHERTYPE_IPV6 : ETHERTYPE_IP);
+ 	}
+ 	memcpy(sockaddr.sll_addr, zconf.gw_mac, ETH_ALEN);
+ 	return EXIT_SUCCESS;

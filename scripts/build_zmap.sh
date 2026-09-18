@@ -6,6 +6,7 @@ project_dir="$(cd -- "$script_dir/.." && pwd)"
 archive="$project_dir/vendor/aim_zmap_reqnr_single.zip"
 compatibility_patch="$project_dir/patches/0001-cmake-json-c-flags.patch"
 generated_source_patch="$project_dir/patches/0002-gengetopt-relative-includes.patch"
+ip_layer_patch="$project_dir/patches/0003-ipv6-iplayer-ethertype.patch"
 work_dir="$project_dir/.build"
 source_dir="$work_dir/aim_zmap_reqnr_single"
 build_dir="$work_dir/zmap-build"
@@ -52,6 +53,15 @@ if grep -Rq '#include "/home/qwerty/' "$source_dir/src"; then
 elif [[ "$(grep -El '^#include "(zopt|topt|zbopt|zitopt|ztopt)\.h"$' \
         "$source_dir"/src/{zopt,topt,zbopt,zitopt,ztopt}.c | wc -l)" -ne 5 ]]; then
     echo "unexpected generated option sources; refusing to apply path patch" >&2
+    exit 1
+fi
+
+# In IP-layer mode the upstream sender tags every packet as IPv4. On an
+# IPv6-in-IPv4 SIT interface this produces IPIP (4), not IPv6 (41).
+if grep -Fq 'sockaddr.sll_protocol = htons(ETHERTYPE_IP);' "$source_dir/src/send-linux.h"; then
+    patch --directory="$source_dir" --strip=1 < "$ip_layer_patch"
+elif ! grep -Fq 'ETHERTYPE_IPV6 : ETHERTYPE_IP' "$source_dir/src/send-linux.h"; then
+    echo "unexpected upstream send-linux.h; refusing to apply IPv6 IP-layer patch" >&2
     exit 1
 fi
 

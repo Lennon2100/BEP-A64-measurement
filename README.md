@@ -26,6 +26,8 @@ plug-in framework is built before two real strategies require shared code.
   RIS collector.
 - `scripts/extract_ris_prefixes.sh`: calls `bgpdump` for every downloaded RIB,
   drops IPv4, and merges deduplicated IPv6 `prefix,origin_asn` rows.
+- `scripts/dedup_ris_prefixes.sh`: folds the multi-collector output to one row
+  per IPv6 prefix while retaining all reported origins as metadata.
 - `scripts/run_scan.sh`: a strict, non-interactive wrapper around
   `icmp6_echoscan_time`.
 - `strategies/README.md`: the minimal target-producer contract.
@@ -67,6 +69,11 @@ IPv6 address, interface, gateway MAC, packets per second, and cooldown seconds.
 Use real authorized values on the Linux measurement host. The wrapper refuses to
 overwrite an existing raw result.
 
+For a point-to-point IPv6 tunnel such as `ipv6net` (SIT/NOARP), pass `-` instead
+of a gateway MAC. The wrapper then uses ZMap's `--iplayer` mode. The build script
+applies the IPv6 protocol-tag fix to the extracted source; the upstream ZIP is
+unchanged. An Ethernet interface still uses its real gateway MAC as before.
+
 The Windows checkout cannot compile or execute this packet engine. Final build
 and runtime verification therefore happens after this directory is copied to the
 Linux measurement server.
@@ -95,8 +102,9 @@ IPv6 prefix/origin pairs:
   data/interim/ris_ipv6_prefixes.csv
 ```
 
-The scripts intentionally match the original BValue collection style: they use
-the moving `latest-bview.gz` files from all collectors and do not create URL or
-checksum sidecars. The extractor does not yet compute the routed union, discard
-prefixes longer than `/64`, create PSUs, or sample A64s. Those remain
-responsibilities of the later `prepare_pilot.py`.
+The multi-collector prefix union is the selected campaign input. The scripts
+download the moving `latest-bview.gz` files; record each actual input identity
+and snapshot time for a campaign. The deduplicated prefix file still contains
+overlapping announcements and prefixes longer than `/64`; it is not a unique
+A64 frame or a target file. Computing that frame and directly sampling A64s
+remain responsibilities of the planned `prepare_campaign.py`.

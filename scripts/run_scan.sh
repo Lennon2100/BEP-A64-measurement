@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -ne 8 ]]; then
-    echo "usage: $0 ZMAP TARGETS OUTPUT SOURCE_IPV6 INTERFACE GATEWAY_MAC RATE_PPS COOLDOWN_SECONDS" >&2
+    echo "usage: $0 ZMAP TARGETS OUTPUT SOURCE_IPV6 INTERFACE GATEWAY_MAC_OR_DASH RATE_PPS COOLDOWN_SECONDS" >&2
     exit 2
 fi
 
@@ -34,7 +34,6 @@ command=(
     --ipv6-target-file "$targets"
     --rate "$rate_pps"
     --cooldown-time "$cooldown_seconds"
-    --gateway-mac "$gateway_mac"
     --interface "$interface"
     --output-module csv
     --output-fields "$fields"
@@ -43,8 +42,13 @@ command=(
     --disable-syslog
 )
 
+if [[ "$gateway_mac" == "-" ]]; then
+    command+=(--iplayer)
+else
+    command+=(--gateway-mac "$gateway_mac")
+fi
+
 printf '%q ' "${command[@]}" > "$command_log"
 printf '\n' >> "$command_log"
 "$zmap_binary" --version > "$version_log" 2>&1 || true
 "${command[@]}"
-

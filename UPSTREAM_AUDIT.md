@@ -38,11 +38,11 @@ slice:
 | ICMPv6 type/code | module fields `type`, `code` |
 | Outer source address | generic `saddr` |
 
-No C patch is required while a scan contains each target at most once. If a
-future strategy sends repeated probes to the identical target in one invocation,
-the accepted limit must be revisited: the module should emit `nrsent` for Echo
-Replies as well as errors and validate that the quoted payload is long enough
-before reading it.
+No probe-module C patch is required while a scan contains each target at most
+once. If a future strategy sends repeated probes to the identical target in one
+invocation, the accepted limit must be revisited: the module should emit
+`nrsent` for Echo Replies as well as errors and validate that the quoted
+payload is long enough before reading it.
 
 ## Reuse as ideas, not as executable project code
 
@@ -91,6 +91,13 @@ refer to the original author's absolute `/home/qwerty/...` build path. The
 matching generated headers are present in the same source directory, so
 `patches/0002-gengetopt-relative-includes.patch` changes only those five includes
 to `"zopt.h"`, `"topt.h"`, `"zbopt.h"`, `"zitopt.h"`, and `"ztopt.h"`.
+
+On the server's SIT/NOARP `ipv6net` interface, an allowed single-target check
+showed a valid ICMPv6 request leaving ZMap as IPv4 protocol 4 (IPIP) instead of
+IPv6-in-IPv4 protocol 41; normal `ping6` used protocol 41 and received a reply.
+`patches/0003-ipv6-iplayer-ethertype.patch` corrects the IP-layer packet tag for
+IPv6 while keeping the IPv4 branch unchanged. It is applied only to the
+extracted build tree; return traffic and CSV output still require server retest.
 
 The ceiling is deliberate: no package framework, generic plug-in loader,
 database, workflow engine, or policy state machine is introduced in this slice.
