@@ -30,14 +30,14 @@ plug-in framework is built before two real strategies require shared code.
   per IPv6 prefix while retaining all reported origins as metadata.
 - `scripts/prepare_campaign.py`: validates the three-column unique-prefix file,
   builds its immediate-parent BGP tree, and derives the nonoverlapping top-level
-  roots plus response-blind root features.
+  roots plus response-blind root features; with explicit seeds it also assigns
+  intact roots and emits the first calibration C64/IID panel.
 - `scripts/run_scan.sh`: a strict, non-interactive wrapper around
   `icmp6_echoscan_time`.
 - `strategies/README.md`: the minimal target-producer contract.
 
-Direct C64 sampling, IID target generation, reference-label aggregation, and
-policy evaluation are not implemented in this first slice. They consume the
-tree/split output and saved raw measurement data later.
+Reference-label aggregation and policy evaluation are not implemented yet.
+They consume the saved target plan and raw measurement data later.
 
 ## Linux build
 
@@ -130,12 +130,13 @@ The command refuses to overwrite its three outputs:
 - `summary.json` records structural counts, excluded rows, total routed C64
   mass, root-length counts/C64 mass, and the root maximum-tree-depth histogram.
 
-The preparation stage does not subdivide a short root or assign tranches. After
+The default preparation stage does not subdivide a short root or assign tranches. After
 inspecting the full root-feature distribution, define a small set of
 response-blind root strata and assign whole roots within strata to calibration
 or held-out using a recorded seed. This preserves the top-level search start
-and prevents response state from crossing the evaluation split. Direct C64
-sampling and IID targets are added after those strata and budgets are fixed.
+and prevents response state from crossing the evaluation split. Calibration
+C64 and IID targets are emitted only when the root split and a separate target
+seed are both supplied.
 
 For the current frame, the recorded root-depth strata are `d0`, `d1`, `d2`,
 and `d3plus`. Re-run into a new output directory to assign exactly one fifth of
@@ -159,3 +160,27 @@ special-purpose 6to4 transition space: native IPv6 routing sends the aggregate
 toward a 6to4 relay rather than treating it as ordinary operator-delegated C64
 space. The source RIS CSV remains unchanged, and the summary records every
 configured exclusion and the number of removed rows.
+
+After verifying the corrected frame and root split, generate the first
+calibration plan in a new directory:
+
+```bash
+python3 scripts/prepare_campaign.py \
+  data/interim/ris_ipv6_prefixes_unique.csv \
+  runs/calibration-plan-native-v1 \
+  --exclude-prefix-file config/frame_exclusions.txt \
+  --split-seed 'bep-journal-root-split-v1-20260919' \
+  --calibration-root-fraction 1/5 \
+  --calibration-target-seed 'bep-journal-calibration-targets-v1-20260919' \
+  --reference-iids 5
+```
+
+The plan contains one `root_uniform` C64 per calibration root and, for every
+nontrivial BGP tree, one distinct `deepest_bgp_guided` C64 where possible. The
+uniform arm records its root, conditional C64, and overall inclusion
+probabilities. The guided arm is a purposive prior-enrichment comparison and
+has no design-based C64 inclusion probability. `calibration_units.csv` records
+the panels; `calibration_targets.csv` records every target; and
+`targets-search.txt` plus `targets-reference-1.txt` through
+`targets-reference-5.txt` are separately hash-shuffled scan rounds. The same
+inputs and seeds reproduce the same files.
