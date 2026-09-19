@@ -32,6 +32,7 @@ command=(
     -M icmp6_echoscan_time
     --ipv6-source-ip "$source_ipv6"
     --ipv6-target-file "$targets"
+    --probes 1
     --rate "$rate_pps"
     --cooldown-time "$cooldown_seconds"
     --interface "$interface"

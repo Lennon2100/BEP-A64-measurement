@@ -34,6 +34,8 @@ plug-in framework is built before two real strategies require shared code.
   intact roots and emits the first calibration C64/IID panel.
 - `scripts/run_scan.sh`: a strict, non-interactive wrapper around
   `icmp6_echoscan_time`.
+- `scripts/parse_results.py`: joins one raw ZMap round to the target manifest,
+  computes RTT, derives the operational response class, and adds timeout rows.
 - `strategies/README.md`: the minimal target-producer contract.
 
 Reference-label aggregation and policy evaluation are not implemented yet.
@@ -184,3 +186,26 @@ the panels; `calibration_targets.csv` records every target; and
 `targets-search.txt` plus `targets-reference-1.txt` through
 `targets-reference-5.txt` are separately hash-shuffled scan rounds. The same
 inputs and seeds reproduce the same files.
+
+## Parse one scan round
+
+Parse each raw round against the complete target manifest and its round name:
+
+```bash
+python3 scripts/parse_results.py \
+  runs/calibration-plan-native-v1/calibration_targets.csv \
+  search \
+  runs/calibration-search/raw-search.csv \
+  runs/calibration-search/probes-search.csv
+```
+
+Valid round names are `search` and `reference-1` through `reference-5`. The
+parser uses the validated `orig-dest-ip` field to join a response to its unique
+planned target and computes RTT from the integer send and receive timestamps.
+It derives `direct`, `slow_au`, `fast_au`, `nr`, `ap`, `rr`, `tx`,
+`other_error`, `timeout`, or `unmatched`; only direct Echo Reply and Type 1
+Code 3 at RTT greater than or equal to 1000 ms set
+`is_observed_positive=1`. A JSON summary is written beside the parsed CSV.
+Multiple raw responses for the same planned target stop parsing because the
+one-row-per-probe selection rule would otherwise be ambiguous; the raw CSV is
+left unchanged for inspection.
