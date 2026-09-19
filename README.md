@@ -29,8 +29,8 @@ plug-in framework is built before two real strategies require shared code.
 - `scripts/dedup_ris_prefixes.sh`: folds the multi-collector output to one row
   per IPv6 prefix while retaining all reported origins as metadata.
 - `scripts/prepare_campaign.py`: validates the three-column unique-prefix file,
-  builds its immediate-parent BGP tree, derives the nonoverlapping routed frame,
-  and freezes deterministic `/32` calibration/held-out split blocks.
+  builds its immediate-parent BGP tree, and derives the nonoverlapping top-level
+  roots plus response-blind root features.
 - `scripts/run_scan.sh`: a strict, non-interactive wrapper around
   `icmp6_echoscan_time`.
 - `strategies/README.md`: the minimal target-producer contract.
@@ -112,32 +112,27 @@ and snapshot time for a campaign. The deduplicated prefix file still contains
 overlapping announcements and may contain prefixes longer than `/64`; it is not
 a target file.
 
-After curating known bad input rows, build the BGP prior tree and freeze the
-calibration/held-out blocks before observing responses:
+After curating known bad input rows, build the BGP prior tree and top-level-root
+summary before defining response-blind root strata:
 
 ```bash
-CAMPAIGN_SEED='record-this-value'
-CALIBRATION_FRACTION='record-this-value'
 python3 scripts/prepare_campaign.py \
   data/interim/ris_ipv6_prefixes_unique.csv \
-  runs/frame-preparation \
-  --seed "$CAMPAIGN_SEED" \
-  --calibration-block-fraction "$CALIBRATION_FRACTION" \
-  --split-prefix-length 32
+  runs/frame-preparation
 ```
 
 The command refuses to overwrite its three outputs:
 
 - `bgp_tree.csv` retains every BGP prefix, origin set, immediate parent, root,
-  tree depth, child count, and tranche where one block contains the node;
-- `frame_blocks.csv` lists nonoverlapping `/32` blocks for short roots and keeps
-  longer roots intact, with C64 mass and tranche;
-- `summary.json` records structural counts, excluded rows, split parameters,
-  and calibration/held-out C64 mass.
+  bit distance, true BGP tree depth, child count, and descendant count;
+- `frame_roots.csv` lists every intact nonoverlapping top-level root, its origin
+  metadata, tree features, and routed C64 count;
+- `summary.json` records structural counts, excluded rows, total routed C64
+  mass, root-length counts/C64 mass, and the root maximum-tree-depth histogram.
 
-A node shorter than `/32` spans multiple split blocks and is marked `mixed` in
-the tree. Split blocks prevent one short aggregate from dominating a tranche;
-they do not replace C64 as the probability-sampling unit. A mixed ancestor may
-provide only fixed BGP metadata; measured response state must not cross from a
-calibration child block into a held-out child block. Inspect the summary and
-freeze the seed/fraction before adding direct C64 sampling and IID targets.
+The preparation stage does not subdivide a short root or assign tranches. After
+inspecting the full root-feature distribution, define a small set of
+response-blind root strata and assign whole roots within strata to calibration
+or held-out using a recorded seed. This preserves the top-level search start
+and prevents response state from crossing the evaluation split. Direct C64
+sampling and IID targets are added after those strata and budgets are fixed.
