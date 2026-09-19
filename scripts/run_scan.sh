@@ -18,7 +18,7 @@ cooldown_seconds="$8"
 [[ -x "$zmap_binary" ]] || { echo "ZMap is not executable: $zmap_binary" >&2; exit 1; }
 [[ -s "$targets" ]] || { echo "target file is missing or empty: $targets" >&2; exit 1; }
 [[ ! -e "$output" ]] || { echo "refusing to overwrite existing output: $output" >&2; exit 1; }
-[[ "$rate_pps" =~ ^[1-9][0-9]*$ ]] || { echo "RATE_PPS must be a positive integer" >&2; exit 1; }
+[[ "$rate_pps" =~ ^[0-9]+$ ]] || { echo "RATE_PPS must be a non-negative integer (0 = no rate limit)" >&2; exit 1; }
 [[ "$cooldown_seconds" =~ ^[0-9]+$ ]] || { echo "COOLDOWN_SECONDS must be a non-negative integer" >&2; exit 1; }
 
 output_dir="$(dirname -- "$output")"

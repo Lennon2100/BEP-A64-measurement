@@ -25,7 +25,7 @@
     "interface": "ipv6net",
     "gateway_mac": "-",
     "probes": 1,
-    "rate_pps": 1000,
+    "rate_pps": 0,
     "cooldown_seconds": 30
   },
   "labels": {

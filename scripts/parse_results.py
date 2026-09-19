@@ -7,7 +7,7 @@ import ipaddress
 import json
 import os
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 
 
 PLAN_FIELDS = [
@@ -179,7 +179,7 @@ def unmatched_row(plan_row, raw_row, raw_row_number, threshold):
 
 
 def load_raw(path, plan, slow_au_threshold_ms):
-    observations = {}
+    responses = defaultdict(list)
     unmatched = []
     with open(path, newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
@@ -205,19 +205,14 @@ def load_raw(path, plan, slow_au_threshold_ms):
                     )
                 )
                 continue
-            if target in observations:
-                raise ValueError(
-                    f"{path}:{line_number}: multiple responses for target {target}; "
-                    "raw evidence is preserved, but one-row probe selection is undefined"
-                )
 
             try:
                 icmp_type = parse_int(row, "type")
                 icmp_code = parse_int(row, "code")
                 rtt_ms = timing_ms(row)
             except ValueError:
-                observations[target] = unmatched_row(
-                    plan_row, row, line_number, slow_au_threshold_ms
+                responses[target].append(
+                    unmatched_row(plan_row, row, line_number, slow_au_threshold_ms)
                 )
                 continue
 
@@ -237,8 +232,32 @@ def load_raw(path, plan, slow_au_threshold_ms):
             )
             output.update(raw_output_fields(row))
             output["quoted_target"] = target
-            observations[target] = output
-    return observations, unmatched
+            responses[target].append(output)
+
+    observations = {}
+    multi_response = []
+    for target, rows in responses.items():
+        if len(rows) == 1:
+            observations[target] = rows[0]
+            continue
+        classes = {row["response_class"] for row in rows}
+        if len(classes) != 1:
+            raise ValueError(
+                f"{path}: multiple responses for target {target} span classes "
+                f"{sorted(classes)}; one-row probe selection is undefined"
+            )
+        # A single probe in a routing loop elicits several same-class responses
+        # from different routers. Keep the first arrival and report the
+        # multiplicity separately; the raw CSV retains every row.
+        observations[target] = rows[0]
+        multi_response.append(
+            {
+                "target": target,
+                "response_count": len(rows),
+                "response_class": classes.pop(),
+            }
+        )
+    return observations, unmatched, multi_response
 
 
 def timeout_row(plan_row, threshold):
@@ -274,7 +293,7 @@ def main(argv):
 
     try:
         plan = load_plan(args.target_manifest, args.round)
-        observations, unmatched = load_raw(
+        observations, unmatched, multi_response = load_raw(
             args.raw_zmap_csv, plan, args.slow_au_threshold_ms
         )
         output_rows = [
@@ -299,7 +318,13 @@ def main(argv):
             "output_csv": os.path.abspath(args.output_csv),
             "slow_au_threshold_ms": args.slow_au_threshold_ms,
             "planned_probe_count": len(plan),
-            "raw_response_count": len(observations) + len(unmatched),
+            "raw_response_count": (
+                len(observations)
+                + len(unmatched)
+                + sum(item["response_count"] - 1 for item in multi_response)
+            ),
+            "multi_response_target_count": len(multi_response),
+            "multi_response_targets": multi_response,
             "output_row_count": len(output_rows),
             "match_status_counts": dict(status_counts),
             "response_class_counts": dict(class_counts),
