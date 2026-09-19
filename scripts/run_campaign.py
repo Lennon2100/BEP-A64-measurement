@@ -114,6 +114,7 @@ def main(argv):
     run_scan = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_scan.sh")
     subprocess.run(
         [
+            "bash",
             run_scan,
             cfg["scanner"]["zmap_binary"],
             sent_path,
