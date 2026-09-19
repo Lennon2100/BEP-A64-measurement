@@ -1,0 +1,43 @@
+{
+  "campaign_id": "calibration-native-v1",
+  "input": {
+    "prefix_csv": "data/interim/ris_ipv6_prefixes_unique.csv",
+    "frame_exclusions": "config/frame_exclusions.txt",
+    "target_manifest": "runs/calibration-plan-native-v1/calibration_targets.csv",
+    "ris_snapshots": []
+  },
+  "sampling": {
+    "root_split_seed": "bep-journal-root-split-v1-20260919",
+    "target_seed": "bep-journal-calibration-targets-v1-20260919",
+    "panel_count": 24942,
+    "rounds": [
+      "search",
+      "reference-1",
+      "reference-2",
+      "reference-3",
+      "reference-4",
+      "reference-5"
+    ]
+  },
+  "scanner": {
+    "zmap_binary": ".build/zmap-build/src/zmap",
+    "source_ipv6": "2607:8700:5500:3959::2",
+    "interface": "ipv6net",
+    "gateway_mac": "-",
+    "probes": 1,
+    "rate_pps": 1000,
+    "cooldown_seconds": 30
+  },
+  "labels": {
+    "slow_au_threshold_ms": 1000,
+    "threshold_sensitivity_ms": [800, 1000, 1200]
+  },
+  "safety": {
+    "scan_exclusions": "config/scan_exclusions.txt",
+    "contact": "",
+    "measurement_page": "",
+    "opt_out": "",
+    "stop_procedure": ""
+  },
+  "output_root": "runs/calibration-native-v1"
+}
