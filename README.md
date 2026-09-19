@@ -28,12 +28,16 @@ plug-in framework is built before two real strategies require shared code.
   drops IPv4, and merges deduplicated IPv6 `prefix,origin_asn` rows.
 - `scripts/dedup_ris_prefixes.sh`: folds the multi-collector output to one row
   per IPv6 prefix while retaining all reported origins as metadata.
+- `scripts/prepare_campaign.py`: validates the three-column unique-prefix file,
+  builds its immediate-parent BGP tree, derives the nonoverlapping routed frame,
+  and freezes deterministic `/32` calibration/held-out split blocks.
 - `scripts/run_scan.sh`: a strict, non-interactive wrapper around
   `icmp6_echoscan_time`.
 - `strategies/README.md`: the minimal target-producer contract.
 
-Benchmark sampling, reference-label aggregation, and policy evaluation are not
-implemented in this first slice. They consume saved raw measurement data later.
+Direct C64 sampling, IID target generation, reference-label aggregation, and
+policy evaluation are not implemented in this first slice. They consume the
+tree/split output and saved raw measurement data later.
 
 ## Linux build
 
@@ -47,8 +51,8 @@ chmod +x scripts/*.sh
 ```
 
 The script prints the resulting `zmap` path. It does not install system-wide.
-It also applies the single compatibility patch under `patches/` to the extracted
-build tree; the vendored ZIP remains byte-for-byte unchanged.
+It applies the build, IPv6 SIT, and Echo CSV field-alignment patches under
+`patches/` to the extracted build tree; the vendored ZIP remains unchanged.
 
 ## Scan wrapper
 
@@ -105,6 +109,35 @@ IPv6 prefix/origin pairs:
 The multi-collector prefix union is the selected campaign input. The scripts
 download the moving `latest-bview.gz` files; record each actual input identity
 and snapshot time for a campaign. The deduplicated prefix file still contains
-overlapping announcements and prefixes longer than `/64`; it is not a unique
-A64 frame or a target file. Computing that frame and directly sampling A64s
-remain responsibilities of the planned `prepare_campaign.py`.
+overlapping announcements and may contain prefixes longer than `/64`; it is not
+a target file.
+
+After curating known bad input rows, build the BGP prior tree and freeze the
+calibration/held-out blocks before observing responses:
+
+```bash
+CAMPAIGN_SEED='record-this-value'
+CALIBRATION_FRACTION='record-this-value'
+python3 scripts/prepare_campaign.py \
+  data/interim/ris_ipv6_prefixes_unique.csv \
+  runs/frame-preparation \
+  --seed "$CAMPAIGN_SEED" \
+  --calibration-block-fraction "$CALIBRATION_FRACTION" \
+  --split-prefix-length 32
+```
+
+The command refuses to overwrite its three outputs:
+
+- `bgp_tree.csv` retains every BGP prefix, origin set, immediate parent, root,
+  tree depth, child count, and tranche where one block contains the node;
+- `frame_blocks.csv` lists nonoverlapping `/32` blocks for short roots and keeps
+  longer roots intact, with C64 mass and tranche;
+- `summary.json` records structural counts, excluded rows, split parameters,
+  and calibration/held-out C64 mass.
+
+A node shorter than `/32` spans multiple split blocks and is marked `mixed` in
+the tree. Split blocks prevent one short aggregate from dominating a tranche;
+they do not replace C64 as the probability-sampling unit. A mixed ancestor may
+provide only fixed BGP metadata; measured response state must not cross from a
+calibration child block into a held-out child block. Inspect the summary and
+freeze the seed/fraction before adding direct C64 sampling and IID targets.

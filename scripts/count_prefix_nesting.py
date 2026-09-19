@@ -3,11 +3,11 @@
 
 Reads the output of dedup_ris_prefixes.sh (one unique IPv6 prefix per row, the
 prefix in the first comma-separated field) and reports the counts needed to
-build the full-A64 frame under D042:
+build the full-C64 frame under D042/D044:
 
   - total unique prefixes
   - the IPv6 default route ::/0 (excluded: a catch-all, not a real routed block)
-  - prefixes longer than /64 (dropped from the frame: they do not define a whole A64)
+  - prefixes longer than /64 (dropped from the frame: they do not define a whole C64)
   - prefixes strictly contained inside a shorter prefix (redundant for address space)
   - top-level prefixes (no covering shorter prefix) that remain for the frame
   - the exact union size N = sum of 2**(64 - prefixlen) over the top-level prefixes
@@ -50,6 +50,20 @@ def load_prefixes(path):
     return prefixes
 
 
+def build_immediate_parent_map(prefixes):
+    """Return child -> nearest covering prefix for a canonical prefix set."""
+    prefix_set = set(prefixes)
+    edges = {}
+    for prefix in prefix_set:
+        ancestor = prefix
+        while ancestor.prefixlen > 0:
+            ancestor = ancestor.supernet()
+            if ancestor in prefix_set:
+                edges[prefix] = ancestor
+                break
+    return edges
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -66,7 +80,7 @@ def main(argv):
 
     all_prefixes = load_prefixes(args.input)
 
-    # D042: announcements longer than /64 do not define a whole A64. The IPv6
+    # D042/D044: announcements longer than /64 do not define a whole C64. The IPv6
     # default route ::/0 (prefixlen 0) is a catch-all, not a routed block, so
     # it is excluded from the frame as well.
     long_prefixes = {p for p in all_prefixes if p.prefixlen > 64}
@@ -76,18 +90,11 @@ def main(argv):
     # A prefix is nested if any strictly-shorter prefix in the set contains it.
     # Walk ancestors one level at a time (at most 64 steps) to keep this O(n),
     # and record each nested prefix's immediate covering prefix (parent).
-    edges = {}  # child -> immediate parent
-    for p in frame_prefixes:
-        q = p
-        while q.prefixlen > 0:
-            q = q.supernet()
-            if q in frame_prefixes:
-                edges[p] = q
-                break
+    edges = build_immediate_parent_map(frame_prefixes)
 
     nested = set(edges)
     top_level = frame_prefixes - nested
-    total_a64 = sum(2 ** (64 - p.prefixlen) for p in top_level)
+    total_c64 = sum(2 ** (64 - p.prefixlen) for p in top_level)
 
     print(f"input file: {args.input}")
     print(f"total unique prefixes: {len(all_prefixes)}")
@@ -95,7 +102,8 @@ def main(argv):
     print(f"prefixes longer than /64 (dropped from frame): {len(long_prefixes)}")
     print(f"prefixes nested inside a shorter prefix (redundant): {len(nested)}")
     print(f"top-level prefixes (frame): {len(top_level)}")
-    print(f"union A64 count N = {total_a64}  (~{total_a64:.3e})")
+    print(f"prefixes acting as an immediate parent: {len(set(edges.values()))}")
+    print(f"union C64 count N = {total_c64}  (~{total_c64:.3e})")
 
     hist = Counter(p.prefixlen for p in top_level)
     print("top-level prefix-length histogram (prefixlen: count):")

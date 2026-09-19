@@ -7,6 +7,7 @@ archive="$project_dir/vendor/aim_zmap_reqnr_single.zip"
 compatibility_patch="$project_dir/patches/0001-cmake-json-c-flags.patch"
 generated_source_patch="$project_dir/patches/0002-gengetopt-relative-includes.patch"
 ip_layer_patch="$project_dir/patches/0003-ipv6-iplayer-ethertype.patch"
+field_alignment_patch="$project_dir/patches/0004-icmp6-echo-field-alignment.patch"
 work_dir="$project_dir/.build"
 source_dir="$work_dir/aim_zmap_reqnr_single"
 build_dir="$work_dir/zmap-build"
@@ -63,6 +64,13 @@ if grep -Fq 'sockaddr.sll_protocol = htons(ETHERTYPE_IP);' "$source_dir/src/send
 elif ! grep -Fq 'ETHERTYPE_IPV6 : ETHERTYPE_IP' "$source_dir/src/send-linux.h"; then
     echo "unexpected upstream send-linux.h; refusing to apply IPv6 IP-layer patch" >&2
     exit 1
+fi
+
+# Echo Replies must emit every declared field; otherwise the CSV projection
+# reads later values from the wrong positions.
+if ! grep -Fq 'fs_add_uint64(fs, "nrsent", (uint64_t)icmp6_hdr->icmp6_data32[5]);' \
+        "$source_dir/src/probe_modules/module_icmp6_echoscan_time.c"; then
+    patch --directory="$source_dir" --strip=1 < "$field_alignment_patch"
 fi
 
 cmake -S "$source_dir" -B "$build_dir" \

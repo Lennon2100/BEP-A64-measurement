@@ -32,17 +32,18 @@ slice:
 | Required fact | Existing field or behavior |
 | --- | --- |
 | Original/quoted target | `orig-dest-ip` |
-| Probe identity | internal validation plus a unique target per scan; `nrsent` is also recovered for quoted ICMPv6 errors |
+| Probe identity | internal validation plus a unique target per scan; patched `nrsent` is emitted for Echo Replies and quoted ICMPv6 errors |
 | Send timestamp | `sent_timestamp_ts`, `sent_timestamp_us` |
-| Receive timestamp | generic `timestamp_str` |
+| Receive timestamp | generic `timestamp_ts`, `timestamp_us` (also retain `timestamp_str`) |
 | ICMPv6 type/code | module fields `type`, `code` |
 | Outer source address | generic `saddr` |
 
-No probe-module C patch is required while a scan contains each target at most
-once. If a future strategy sends repeated probes to the identical target in one
-invocation, the accepted limit must be revisited: the module should emit
-`nrsent` for Echo Replies as well as errors and validate that the quoted
-payload is long enough before reading it.
+The observed Echo CSV shift requires one probe-module correction even when each
+target appears only once: emit `nrsent` for Echo Replies as well as errors so
+the positional output matches its declared fields. The patch also requires the
+full 20-byte quoted payload before reading the request number. If a future
+strategy sends repeated probes to the identical target in one invocation,
+matching by request number must also be revisited.
 
 ## Reuse as ideas, not as executable project code
 
@@ -97,7 +98,12 @@ showed a valid ICMPv6 request leaving ZMap as IPv4 protocol 4 (IPIP) instead of
 IPv6-in-IPv4 protocol 41; normal `ping6` used protocol 41 and received a reply.
 `patches/0003-ipv6-iplayer-ethertype.patch` corrects the IP-layer packet tag for
 IPv6 while keeping the IPv4 branch unchanged. It is applied only to the
-extracted build tree; return traffic and CSV output still require server retest.
+extracted build tree. The user reports that the patched scanner sent an outer
+protocol-41 Echo Request and received its Reply, but the Echo CSV row is not
+yet usable: `nrsent` is absent in that probe-module branch, shifting subsequent
+positional fields, including `classification` and receive time.
+`patches/0004-icmp6-echo-field-alignment.patch` addresses that field shift;
+server-side rebuild and output checks remain pending.
 
 The ceiling is deliberate: no package framework, generic plug-in loader,
 database, workflow engine, or policy state machine is introduced in this slice.

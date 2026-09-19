@@ -26,7 +26,7 @@ mkdir -p "$output_dir"
 command_log="${output}.command.txt"
 version_log="${output}.scanner-version.txt"
 
-fields="orig-dest-ip,classification,type,code,saddr,ttl,original_ttl,sent_timestamp_ts,sent_timestamp_us,nrsent,timestamp_str"
+fields="orig-dest-ip,classification,success,type,code,saddr,ttl,original_ttl,sent_timestamp_ts,sent_timestamp_us,nrsent,timestamp_str,timestamp_ts,timestamp_us"
 command=(
     "$zmap_binary"
     -M icmp6_echoscan_time
