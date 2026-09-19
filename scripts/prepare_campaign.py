@@ -33,7 +33,28 @@ def parse_fraction(text):
     return value
 
 
-def load_rows(path):
+def load_exclusions(path):
+    exclusions = []
+    if not path:
+        return exclusions
+    with open(path, encoding="utf-8") as fh:
+        for line_number, line in enumerate(fh, 1):
+            text = line.split("#", 1)[0].strip()
+            if not text:
+                continue
+            try:
+                prefix = ipaddress.ip_network(text, strict=True)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid exclusion {text!r}"
+                ) from exc
+            if prefix.version != 6:
+                raise ValueError(f"{path}:{line_number}: non-IPv6 exclusion {prefix}")
+            exclusions.append(prefix)
+    return exclusions
+
+
+def load_rows(path, exclusions):
     rows = {}
     excluded = Counter()
     with open(path, newline="", encoding="utf-8") as fh:
@@ -80,6 +101,20 @@ def load_rows(path):
             if prefix.prefixlen > 64:
                 excluded["longer_than_64"] += 1
                 continue
+            containing_exclusions = [
+                item for item in exclusions if prefix.subnet_of(item)
+            ]
+            if containing_exclusions:
+                excluded[f"configured:{containing_exclusions[0]}"] += 1
+                continue
+            partial_exclusions = [
+                item for item in exclusions if item.subnet_of(prefix)
+            ]
+            if partial_exclusions:
+                raise ValueError(
+                    f"input prefix {prefix} contains configured exclusion "
+                    f"{partial_exclusions[0]}; partial-prefix subtraction is unsupported"
+                )
             rows[prefix] = {
                 "origin_count": declared_count,
                 "origins": origins,
@@ -177,6 +212,7 @@ def main(argv):
         ),
     )
     parser.add_argument("output_dir")
+    parser.add_argument("--exclude-prefix-file")
     parser.add_argument("--split-seed")
     parser.add_argument("--calibration-root-fraction", type=parse_fraction)
     args = parser.parse_args(argv)
@@ -191,7 +227,8 @@ def main(argv):
         return 2
 
     try:
-        metadata, excluded = load_rows(args.input)
+        exclusions = load_exclusions(args.exclude_prefix_file)
+        metadata, excluded = load_rows(args.input, exclusions)
         prefixes = set(metadata)
         parents = build_immediate_parent_map(prefixes)
         children = defaultdict(list)
@@ -291,6 +328,12 @@ def main(argv):
 
         summary = {
             "input": os.path.abspath(args.input),
+            "exclude_prefix_file": (
+                os.path.abspath(args.exclude_prefix_file)
+                if args.exclude_prefix_file
+                else None
+            ),
+            "configured_exclusions": [str(prefix) for prefix in exclusions],
             "usable_prefix_count": len(prefixes),
             "nested_prefix_count": len(parents),
             "top_level_prefix_count": len(roots),

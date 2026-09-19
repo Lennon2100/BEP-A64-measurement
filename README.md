@@ -144,7 +144,8 @@ the roots in each stratum to calibration by deterministic hash rank:
 ```bash
 python3 scripts/prepare_campaign.py \
   data/interim/ris_ipv6_prefixes_unique.csv \
-  runs/frame-root-split-v1 \
+  runs/frame-root-split-native-v1 \
+  --exclude-prefix-file config/frame_exclusions.txt \
   --split-seed 'bep-journal-root-split-v1-20260919' \
   --calibration-root-fraction 1/5
 ```
@@ -152,3 +153,9 @@ python3 scripts/prepare_campaign.py \
 Every prefix under one root receives the same tranche. The summary reports root
 counts and C64 combinatorial mass for both sides and for each depth stratum.
 C64 mass is diagnostic only and does not control the split or probe budget.
+
+`config/frame_exclusions.txt` currently excludes `2002::/16`. It is IANA
+special-purpose 6to4 transition space: native IPv6 routing sends the aggregate
+toward a 6to4 relay rather than treating it as ordinary operator-delegated C64
+space. The source RIS CSV remains unchanged, and the summary records every
+configured exclusion and the number of removed rows.
