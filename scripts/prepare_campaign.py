@@ -5,19 +5,32 @@ This first preparation slice deliberately stops before C64 sampling and IID
 generation.  Those require campaign budgets and strata that are not yet
 chosen.  It preserves every valid BGP prefix as evidence, uses only top-level
 prefixes for non-overlapping frame accounting, and reports the response-blind
-root features needed to define calibration/held-out strata.  It does not split
-a top-level search root or assign tranches before those strata are chosen.
+root features needed to define calibration/held-out strata.  With explicit
+split options, it assigns whole roots within fixed depth strata; it never
+splits a top-level search root.
 """
 
 import argparse
 import csv
+import hashlib
 import ipaddress
 import json
 import os
 import sys
 from collections import Counter, defaultdict
+from fractions import Fraction
 
 from count_prefix_nesting import build_immediate_parent_map, project_dir
+
+
+def parse_fraction(text):
+    try:
+        value = Fraction(text)
+    except (ValueError, ZeroDivisionError) as exc:
+        raise argparse.ArgumentTypeError("fraction must be a decimal or ratio") from exc
+    if not 0 < value < 1:
+        raise argparse.ArgumentTypeError("fraction must be between 0 and 1")
+    return value
 
 
 def load_rows(path):
@@ -104,6 +117,47 @@ def tree_depth_for(prefix, parents, cache):
     return cache[prefix]
 
 
+def root_depth_stratum(max_tree_depth):
+    if max_tree_depth >= 3:
+        return "d3plus"
+    return f"d{max_tree_depth}"
+
+
+def assign_root_tranches(roots_by_stratum, seed, calibration_fraction):
+    assignments = {}
+    counts = {}
+    for stratum in sorted(roots_by_stratum):
+        roots = roots_by_stratum[stratum]
+        ranked = sorted(
+            roots,
+            key=lambda root: hashlib.sha256(
+                f"{seed}\0{stratum}\0{root}".encode("ascii")
+            ).digest()
+            + int(root.network_address).to_bytes(16, "big"),
+        )
+        calibration_count = (
+            len(ranked) * calibration_fraction.numerator
+            + calibration_fraction.denominator // 2
+        ) // calibration_fraction.denominator
+        if len(ranked) >= 2:
+            calibration_count = min(max(calibration_count, 1), len(ranked) - 1)
+        elif ranked:
+            raise ValueError(
+                f"root stratum {stratum} has one root and cannot be split"
+            )
+        calibration = set(ranked[:calibration_count])
+        for root in ranked:
+            assignments[root] = (
+                "calibration" if root in calibration else "held_out"
+            )
+        counts[stratum] = {
+            "root_count": len(ranked),
+            "calibration_root_count": calibration_count,
+            "held_out_root_count": len(ranked) - calibration_count,
+        }
+    return assignments, counts
+
+
 def write_csv(path, fieldnames, rows):
     if os.path.exists(path):
         raise FileExistsError(f"refusing to overwrite existing output: {path}")
@@ -123,7 +177,14 @@ def main(argv):
         ),
     )
     parser.add_argument("output_dir")
+    parser.add_argument("--split-seed")
+    parser.add_argument("--calibration-root-fraction", type=parse_fraction)
     args = parser.parse_args(argv)
+
+    if bool(args.split_seed) != bool(args.calibration_root_fraction):
+        parser.error(
+            "--split-seed and --calibration-root-fraction must be supplied together"
+        )
 
     if not os.path.isfile(args.input):
         print(f"input file does not exist: {args.input}", file=sys.stderr)
@@ -166,17 +227,41 @@ def main(argv):
                 }
             )
 
+        roots_by_stratum = defaultdict(list)
+        for root in roots:
+            roots_by_stratum[root_depth_stratum(root_max_tree_depth[root])].append(root)
+        tranche_by_root = {}
+        split_stratum_counts = {}
+        if args.split_seed:
+            tranche_by_root, split_stratum_counts = assign_root_tranches(
+                roots_by_stratum, args.split_seed, args.calibration_root_fraction
+            )
+
+        for row in tree_rows:
+            root = ipaddress.ip_network(row["root_prefix"])
+            row["root_stratum"] = root_depth_stratum(root_max_tree_depth[root])
+            row["tranche"] = tranche_by_root.get(root, "")
+
         root_rows = []
         total_c64_count = 0
         root_length_count = Counter()
         root_length_c64_count = Counter()
         root_tree_depth_count = Counter()
+        tranche_root_count = Counter()
+        tranche_c64_count = Counter()
+        stratum_tranche_c64_count = defaultdict(Counter)
         for root in sorted(roots, key=lambda p: (int(p.network_address), p.prefixlen)):
             c64_count = 1 << (64 - root.prefixlen)
+            stratum = root_depth_stratum(root_max_tree_depth[root])
+            tranche = tranche_by_root.get(root, "")
             total_c64_count += c64_count
             root_length_count[root.prefixlen] += 1
             root_length_c64_count[root.prefixlen] += c64_count
             root_tree_depth_count[root_max_tree_depth[root]] += 1
+            if tranche:
+                tranche_root_count[tranche] += 1
+                tranche_c64_count[tranche] += c64_count
+                stratum_tranche_c64_count[stratum][tranche] += c64_count
             root_rows.append(
                 {
                     "root_prefix": str(root),
@@ -187,6 +272,8 @@ def main(argv):
                     "descendant_prefix_count": descendant_count[root],
                     "max_bgp_tree_depth": root_max_tree_depth[root],
                     "routed_c64_count": c64_count,
+                    "root_stratum": stratum,
+                    "tranche": tranche,
                 }
             )
 
@@ -227,6 +314,27 @@ def main(argv):
                 "frame_roots": os.path.abspath(roots_path),
             },
         }
+        if args.split_seed:
+            for stratum in split_stratum_counts:
+                split_stratum_counts[stratum]["calibration_routed_c64_count"] = (
+                    stratum_tranche_c64_count[stratum]["calibration"]
+                )
+                split_stratum_counts[stratum]["held_out_routed_c64_count"] = (
+                    stratum_tranche_c64_count[stratum]["held_out"]
+                )
+            summary["root_split"] = {
+                "method": "exact_hash_rank_within_root_depth_stratum",
+                "seed": args.split_seed,
+                "calibration_root_fraction": str(args.calibration_root_fraction),
+                "strata": split_stratum_counts,
+                "tranches": {
+                    tranche: {
+                        "root_count": tranche_root_count[tranche],
+                        "routed_c64_count": tranche_c64_count[tranche],
+                    }
+                    for tranche in ("calibration", "held_out")
+                },
+            }
         with open(summary_path, "w", encoding="utf-8") as fh:
             json.dump(summary, fh, indent=2, sort_keys=True)
             fh.write("\n")

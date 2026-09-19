@@ -136,3 +136,19 @@ response-blind root strata and assign whole roots within strata to calibration
 or held-out using a recorded seed. This preserves the top-level search start
 and prevents response state from crossing the evaluation split. Direct C64
 sampling and IID targets are added after those strata and budgets are fixed.
+
+For the current frame, the recorded root-depth strata are `d0`, `d1`, `d2`,
+and `d3plus`. Re-run into a new output directory to assign exactly one fifth of
+the roots in each stratum to calibration by deterministic hash rank:
+
+```bash
+python3 scripts/prepare_campaign.py \
+  data/interim/ris_ipv6_prefixes_unique.csv \
+  runs/frame-root-split-v1 \
+  --split-seed 'bep-journal-root-split-v1-20260919' \
+  --calibration-root-fraction 1/5
+```
+
+Every prefix under one root receives the same tranche. The summary reports root
+counts and C64 combinatorial mass for both sides and for each depth stratum.
+C64 mass is diagnostic only and does not control the split or probe budget.
