@@ -1,14 +1,14 @@
 {
-  "campaign_id": "formal-full-tree-proposed-v1",
+  "campaign_id": "formal-journal-subrecon-5b-v1",
   "input": {
-    "bgp_tree_csv": "runs/frame-preparation/bgp_tree.csv",
-    "prior_c64_manifest": "runs/calibration-native-v1/effective_calibration_targets.csv",
-    "scan_exclusions": "config/scan_exclusions.txt",
-    "ris_snapshots": []
+    "journal_prefix_csv": "data/interim/ris_ipv6_prefixes_unique.csv",
+    "subrecon_prefix_csv": "data/interim/ris_ipv6_top_level_prefixes.csv",
+    "frame_exclusions": "config/frame_exclusions.txt",
+    "prior_c64_manifest": "runs/calibration-native-v1/effective_calibration_targets.csv"
   },
   "seed": "bep-full-tree-formal-v1",
-  "budget_total_per_method": 1000000,
-  "journal_historical_probes": 149652,
+  "budget_total_per_method": 5000000000,
+  "historical_probes": {"journal": 149652},
   "batch_size": 8192,
   "slow_au_threshold_ms": 1000,
   "scanner": {
@@ -16,7 +16,6 @@
     "source_ipv6": "2607:8700:5500:3959::2",
     "interface": "ipv6net",
     "gateway_mac": "-",
-    "probes": 1,
     "rate_pps": 1000,
     "cooldown_seconds": 30
   },
@@ -30,13 +29,7 @@
       "bgp_weight": 0.25,
       "root_budget_fraction": 0.5
     },
-    "tnet": {
-      "screen_budget": 200000,
-      "rounds": 10,
-      "top_k": 10000,
-      "temperature": 1
-    },
     "subrecon": {}
   },
-  "output_root": "runs/formal-full-tree-v1"
+  "output_root": "runs/formal-journal-subrecon-5b-v1"
 }

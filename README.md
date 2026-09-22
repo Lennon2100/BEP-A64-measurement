@@ -12,12 +12,10 @@ strategy implementation -> ordered target file -> run_scan.sh -> raw ZMap CSV
 ```
 
 Each search strategy or adapted comparator remains a separate target producer.
-The scanner need not know whether a target came from the journal policy,
-paper-based TNet reproduction, or BGP-only ICNP SubRecon strategy adaptation.
-The three methods will share the same BGP-prefix input, not activity-bearing
-target lists; offline prefix-tree construction spends no scan probes. The
-SubRecon adaptation must not import an external Hitlist or active-address
-seed. `scripts/run_formal.py` runs one adaptive method through this boundary;
+The scanner need not know which method produced a target. The journal strategy
+reads the full unique RIS prefix CSV; the BGP-only ICNP SubRecon adaptation
+reads the separate top-level-prefix CSV. Neither receives D050 response labels
+or an external Hitlist. `scripts/run_formal.py` runs one method through this boundary;
 `campaign.json` remains the completed fixed-panel D050 configuration.
 
 ## Included now
@@ -40,47 +38,82 @@ seed. `scripts/run_formal.py` runs one adaptive method through this boundary;
   `icmp6_echoscan_time`.
 - `scripts/parse_results.py`: joins one raw ZMap round to the target manifest,
   computes RTT, derives the operational response class, and adds timeout rows.
+  Formal runs also request matched Type 1 Code 3 AU source addresses before
+  same-class multi-response folding.
 - `strategies/README.md`: the minimal target-producer contract.
-- `strategies/journal.py`, `strategies/tnet.py`, and
-  `strategies/subrecon.py`: the three independent formal search policies.
+- `strategies/journal.py` and `strategies/subrecon.py`: the implemented
+  formal search policies. TNet remains pending because its unpublished code
+  and unspecified numerical policy do not determine a unique reproduction.
 - `scripts/run_formal.py`: the formal scan, parse, and cost-ledger loop.
+- `scripts/analyze_formal.py`: cost and discovery tables for configured methods.
 
 `scripts/analyze_campaign.py` already aggregates the D050 reference labels and
 calibration results. The formal runner writes per-method cumulative cost and
 discovery ledgers; it does not combine them into a paper figure.
 
-## Formal three-method run
+## Formal journal and SubRecon run
 
 Copy `formal.example.json` to a new configuration on the Linux measurement
-host. Replace its proposed budget and coefficients with frozen choices, fill
-`input.ris_snapshots` with exact collector RIB identities, and point
-`input.bgp_tree_csv` and `input.prior_c64_manifest` at the server's prepared
-tree and D050 effective manifest. Check the source address, interface, scan
-exclusions, finite packet rate, and output directory. The example has an empty
-`ris_snapshots` list, so `run_formal.py` rejects it before sending probes.
+host. It records a 5B ceiling for each method and `theta_b=1`, whose root
+base quotas fit inside the configured half-budget root allocation by
+response-blind arithmetic. Confirm the
+source address, interface, finite packet rate, and output directory before
+sending probes. The input paths in the example match
+`MEASUREMENT_RUNBOOK.md`: the journal method loads
+`data/interim/ris_ipv6_prefixes_unique.csv`, SubRecon loads
+`data/interim/ris_ipv6_top_level_prefixes.csv`, and the prior `/64` manifest
+records the shared policy of excluding D050 search targets from fresh probing.
 
 ```bash
-python3 scripts/run_formal.py formal.json journal
-python3 scripts/run_formal.py formal.json tnet
-python3 scripts/run_formal.py formal.json subrecon
+sudo python3 scripts/run_formal.py formal.json journal
+sudo python3 scripts/run_formal.py formal.json subrecon
+python3 scripts/analyze_formal.py formal.json
 ```
 
-Each invocation refuses to overwrite its method directory. Every batch keeps
-the target manifest, ordered sent list, scanner command and version, raw ZMap
-CSV, parsed per-probe CSV, and strategy metadata. `ledger.csv` records charged
-stages, cumulative formal probes, attributed total probes, and distinct newly
+Start a method without `--resume` only when its output directory is absent.
+For a graceful stop, send SIGINT or SIGTERM once; the current batch finishes,
+is compressed, and the runner exits with `status: paused`. Continue it with:
+
+```bash
+sudo python3 scripts/run_formal.py formal.json journal --resume
+sudo python3 scripts/run_formal.py formal.json subrecon --resume
+```
+
+Each completed batch is one `batch-000000001.tar.gz` archive containing the
+target manifest, ordered sent list, scanner command and version, raw ZMap CSV,
+parsed per-probe CSV, matched AU router observations, strategy metadata, and
+that batch's `ledger.csv`. The temporary `.work` directory is removed only after
+the archive has been written and read back. Compression temporarily needs space
+for both the working batch and its archive. An interrupted `.work` or `.tar.gz.part`
+batch blocks automatic resume because some probes may already have been sent;
+inspect its scan evidence before deciding what to do. Resume rebuilds strategy
+state from completed archives and their actual parsed responses, so its startup
+cost grows with the completed probe count. The configuration must match the
+recorded `formal.json`.
+
+Each method writes `last-hop-routers.txt.gz` with distinct observed AU source IPv6
+addresses; `summary.json` and `comparison.csv` report that count. These are
+candidate last-hop interface addresses, not verified router identities, and
+they do not change the discovery metric or seed a strategy. Each archived
+ledger records charged stages, cumulative formal probes, attributed total
+probes, and distinct newly
 observed IMC-positive `/64`s. The journal total includes the 149,652 D050
 historical probes; D050 positives are not counted as fresh formal discoveries.
 All methods exclude the same D050 search `/64`s from new selection without
 using their old responses as search labels.
 
-The TNet adaptation uses a budgeted `/48` screen and `/48` plus `/52` feedback
-allocation. It is a paper-based reimplementation because TNet source is not
-available here. The conference SubRecon adaptation starts from BGP prefixes,
+The conference SubRecon adaptation starts from the top-level BGP prefixes,
 uses `thuname/subrecon`'s `src/budget.c` probe table, and refines using AU
 source diversity and response coverage. Its external Hitlist expansion phase
-is omitted. Native comparator regions or prefixes stay in
-`native-prefixes.txt` separately from the common positive `/64` count.
+is omitted. When present, native comparator prefixes are written to
+`native-prefixes.txt.gz` separately from the common positive `/64` count.
+`analyze_formal.py` writes `comparison.csv` and `cost-discovery-curve.csv.gz`.
+
+To add TNet later, add `strategies/tnet.py` with `load_frame(config, base)`,
+`Strategy.next_batch(limit)`, and `Strategy.feedback(parsed_rows)`, then add
+its parameters under `strategies.tnet` in the configuration. The runner and
+analyzer select configured strategy names; TNet's `/48` screen probes must be
+reported as a charged stage by that strategy.
 
 ## Linux build
 
@@ -151,7 +184,8 @@ IPv6 prefix/origin pairs:
 
 The multi-collector prefix union is the selected campaign input. The scripts
 download the moving `latest-bview.gz` files; record each actual input identity
-and snapshot time for a campaign. The deduplicated prefix file still contains
+and snapshot time separately if needed; the formal runner does not require
+snapshot metadata. The deduplicated prefix file still contains
 overlapping announcements and may contain prefixes longer than `/64`; it is not
 a target file.
 

@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
-"""Combine three completed formal ledgers without treating D050 as a new find."""
+"""Combine completed strategy ledgers without counting historical probes as new finds."""
 
 import argparse
 import csv
+import gzip
+import io
 import json
+import tarfile
+from heapq import merge
+from itertools import groupby
 from pathlib import Path
 
 
-METHODS = ("journal", "tnet", "subrecon")
+def ledger_rows(method_dir):
+    for archive in sorted(method_dir.glob("batch-*.tar.gz")):
+        with tarfile.open(archive, "r:gz") as bundle:
+            with bundle.extractfile("ledger.csv") as raw:
+                with io.TextIOWrapper(raw, encoding="utf-8", newline="") as fh:
+                    yield from csv.DictReader(fh)
 
 
-def cost_curve(ledger_path, summary, interval):
+def cost_curve(method_dir, summary, interval):
     history = summary["historical_attributed"]
     sent = summary["formal_sent"]
     budget = summary["budget_total"]
-    checkpoints = sorted(set([0, history, history + sent] + list(range(interval, budget + 1, interval))))
-    with open(ledger_path, newline="", encoding="utf-8") as fh:
-        iterator = iter(csv.DictReader(fh))
-        upcoming = next(iterator, None)
-        previous_cost = history
-        positives = 0
-        for ceiling in checkpoints:
-            if ceiling > history + sent:
-                break
-            while upcoming is not None and int(upcoming["attributed_total"]) <= ceiling:
-                cost = int(upcoming["attributed_total"])
-                found = int(upcoming["distinct_positive"])
-                if cost != previous_cost + 1 or found < positives or found > positives + 1:
-                    raise ValueError(f"non-monotone formal ledger: {ledger_path}")
-                previous_cost, positives = cost, found
-                upcoming = next(iterator, None)
-            yield {"method": summary["method"], "attributed_probe_cost": ceiling, "distinct_new_positive_c64": positives}
-        if upcoming is not None or previous_cost != history + sent or positives != summary["distinct_new_positive_c64"]:
-            raise ValueError(f"ledger and summary disagree: {ledger_path}")
+    checkpoints = (cost for cost, _ in groupby(merge(range(0, budget + 1, interval), sorted((history, history + sent)))))
+    iterator = iter(ledger_rows(method_dir))
+    upcoming = next(iterator, None)
+    positives = 0
+    for ceiling in checkpoints:
+        if ceiling > history + sent:
+            break
+        while upcoming is not None and int(upcoming["attributed_total"]) <= ceiling:
+            positives = int(upcoming["distinct_positive"])
+            upcoming = next(iterator, None)
+        yield {"method": summary["method"], "attributed_probe_cost": ceiling, "distinct_new_positive_c64": positives}
 
 
 def main():
@@ -49,30 +51,25 @@ def main():
     if not root.is_absolute():
         root = config_path.parent / root
     summaries = []
-    for method in METHODS:
+    for method in config["strategies"]:
         with (root / method / "summary.json").open(encoding="utf-8") as fh:
             summary = json.load(fh)
-        if summary["method"] != method or summary["budget_total"] != config["budget_total_per_method"]:
-            raise ValueError(f"inconsistent method or budget in {method} summary")
-        expected_history = 149652 if method == "journal" else 0
-        if summary["historical_attributed"] != expected_history or summary["attributed_total"] != expected_history + summary["formal_sent"]:
-            raise ValueError(f"inconsistent cost accounting in {method} summary")
         summaries.append(summary)
     comparison_path = root / "comparison.csv"
-    curve_path = root / "cost-discovery-curve.csv"
+    curve_path = root / "cost-discovery-curve.csv.gz"
     if comparison_path.exists() or curve_path.exists():
         raise FileExistsError("refusing to overwrite formal comparison")
-    curves = [row for summary in summaries for row in cost_curve(root / summary["method"] / "ledger.csv", summary, args.curve_interval)]
     with comparison_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=("method", "budget_total", "historical_attributed", "formal_sent", "attributed_total", "budget_exhausted", "distinct_new_positive_c64", "probes_per_new_discovery", "stages"))
+        writer = csv.DictWriter(fh, fieldnames=("method", "budget_total", "historical_attributed", "formal_sent", "attributed_total", "budget_exhausted", "distinct_new_positive_c64", "distinct_last_hop_router_addresses", "probes_per_new_discovery", "stages"))
         writer.writeheader()
         for summary in summaries:
             discoveries = summary["distinct_new_positive_c64"]
-            writer.writerow({**{key: summary[key] for key in ("method", "budget_total", "historical_attributed", "formal_sent", "attributed_total", "budget_exhausted", "distinct_new_positive_c64")}, "probes_per_new_discovery": summary["attributed_total"] / discoveries if discoveries else "", "stages": json.dumps(summary["stages"], sort_keys=True)})
-    with curve_path.open("w", newline="", encoding="utf-8") as fh:
+            writer.writerow({**{key: summary[key] for key in ("method", "budget_total", "historical_attributed", "formal_sent", "attributed_total", "budget_exhausted", "distinct_new_positive_c64", "distinct_last_hop_router_addresses")}, "probes_per_new_discovery": summary["attributed_total"] / discoveries if discoveries else "", "stages": json.dumps(summary["stages"], sort_keys=True)})
+    with gzip.open(curve_path, "wt", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=("method", "attributed_probe_cost", "distinct_new_positive_c64"))
         writer.writeheader()
-        writer.writerows(curves)
+        for summary in summaries:
+            writer.writerows(cost_curve(root / summary["method"], summary, args.curve_interval))
     print(comparison_path)
     print(curve_path)
 

@@ -7,6 +7,13 @@ seed is available under the common BGP-only input rule.
 import bisect
 from collections import deque
 
+from strategies.common import Frame
+
+
+def load_frame(cfg, base):
+    inputs = cfg["input"]
+    return Frame.subrecon(base / inputs["subrecon_prefix_csv"], base / inputs["frame_exclusions"])
+
 
 # thuname/subrecon src/budget.c, indexed by prefix length 0..64.
 PROBE_TABLE = (
@@ -27,8 +34,6 @@ class Strategy:
     def __init__(self, frame, targets, cfg, allowance):
         self.targets = targets
         self.queue = deque(sorted(frame.prefixes, key=lambda p: (p.prefixlen, str(p))))
-        self.current = None
-        self.records = {}
         self.records_by_root = {root: {} for root in frame.roots}
         self.roots = frame.roots
         self.root_starts = [int(root.network_address) >> 64 for root in frame.roots]
@@ -42,8 +47,7 @@ class Strategy:
         root_index = bisect.bisect_right(self.root_starts, start) - 1
         return [row for c64, row in self.records_by_root[self.roots[root_index]].items() if start <= c64 < end]
 
-    def _finish(self):
-        prefix = self.current
+    def _finish(self, prefix):
         rows = self._rows_in(prefix)
         sources = {row["icmp_source"] for row in rows if row["response_class"] in ("slow_au", "fast_au") and row["icmp_source"]}
         replies = sum(row["response_class"] in ("slow_au", "fast_au", "direct") for row in rows)
@@ -55,42 +59,37 @@ class Strategy:
                 if child not in self.seen_nodes:
                     self.queue.append(child)
                     self.seen_nodes.add(child)
-        self.current = None
 
     def next_batch(self, limit):
         if self.pending:
             raise ValueError("feedback required before next batch")
-        while True:
-            if self.current is None:
-                if not self.queue:
-                    return []
-                self.current = self.queue.popleft()
-            prefix = self.current
+        batch = []
+        selected_nodes = set()
+        while self.queue and len(batch) < limit:
+            prefix = self.queue.popleft()
+            if prefix in selected_nodes:
+                self.queue.appendleft(prefix)
+                break
+            selected_nodes.add(prefix)
             rows = self._rows_in(prefix)
             sources = {row["icmp_source"] for row in rows if row["response_class"] in ("slow_au", "fast_au") and row["icmp_source"]}
-            if len(sources) > 1:
-                self._finish()
-                continue
             remaining = PROBE_TABLE[prefix.prefixlen] - len(rows)
-            if remaining <= 0:
-                self._finish()
+            if len(sources) > 1 or remaining <= 0:
+                self._finish(prefix)
                 continue
-            batch = []
-            for _ in range(min(limit, remaining)):
-                c64 = self.targets.draw(prefix)
-                if c64 is None:
-                    break
-                batch.append({"c64": c64, "node": str(prefix), "stage": "delimitation"})
-            if batch:
-                self.pending = batch
-                return batch
-            self._finish()
+            c64 = self.targets.draw(prefix)
+            if c64 is None:
+                self._finish(prefix)
+                continue
+            batch.append({"c64": c64, "node": str(prefix), "stage": "delimitation"})
+            self.queue.append(prefix)
+        self.pending = batch
+        return batch
 
     def feedback(self, rows):
         if len(rows) != len(self.pending):
             raise ValueError("SubRecon feedback size mismatch")
         for item, row in zip(self.pending, rows):
-            self.records[item["c64"]] = row
             index = bisect.bisect_right(self.root_starts, item["c64"]) - 1
             self.records_by_root[self.roots[index]][item["c64"]] = row
         self.pending = []

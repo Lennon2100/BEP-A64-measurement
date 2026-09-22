@@ -2,6 +2,53 @@
 
 本文档是给接手"正式实网测量"的实现者（人或 agent）的交接说明。它把当前已完成的校准管线、服务器环境、ZMap 参数、数据契约、以及**当前（2026-09-22）研究方向和下一步要写什么**一次性讲清楚，使接手者不需要再翻代码就能动手。
 
+**2026-09-22 状态**：`strategies/journal.py`、`strategies/subrecon.py`、`scripts/run_formal.py` 与 `scripts/analyze_formal.py` 已写入 Windows 工作区，尚未在 Linux 测量主机执行。两种策略各有独立状态，共用发包、解析和记账流程，也都记录末跳路由器候选地址；正式 runner 现按批压缩归档，并支持从完整归档续跑。TNet 暂缓；后续增加 `strategies/tnet.py` 和配置项即可接入。当前示例配置为**每种方法各自 5B 总预算**，原先讨论的 100B 是上限。正式 runner 不读取 scan 排除表；下文涉及 `scan_exclusions.txt` 的段落只记录 D050 校准历史。用户纠正前曾执行三项本机模拟反馈测试；相关测试文件及缓存已删除，纠正后未再运行模拟或验证。本轮没有公网探测。
+
+### RIS 输入与末跳路由器副产品
+
+`scripts/download_ris.sh` 曾逐个下载 `https://data.ris.ripe.net/<rrc>/latest-bview.gz` 并生成当前前缀 CSV。正式 runner 只读取冻结的前缀 CSV，不读取 RIB 或 RIS 快照身份；当前 `formal.example.json` 已移除 `input.ris_snapshots`，运行时无须补填。
+
+正式 parser 现在可把**匹配目标的 ICMPv6 Type 1 Code 3 Address Unreachable 响应源 IPv6**另存为每批 `last-hop-router-observations.csv`，包括慢 AU、快 AU 和同目标的多条同类响应。方法结束时，runner 写出按地址去重的 `last-hop-routers.txt.gz`，并在 `summary.json` / `comparison.csv` 中报告地址数。这个判据参照 SubRecon 公开代码的 delimitation 接收分支；它提供的是**候选末跳路由器接口地址**，不是经过独立拓扑核验的设备数。原始 CSV 和逐探针结果仍保留；该副产品不触发额外探针、不作为外部种子，也不改变 IMC 阳性 `/64` 的计分。
+
+### 正式扫描能否直接开始
+
+**当前可在具备数据和 ZMap 的 Linux 主机上调用真实扫描代码，但本轮尚未核实该主机状态。** 本机工作区没有以下运行数据；它们据历史记录位于 Linux 主机：`data/interim/ris_ipv6_prefixes_unique.csv`、`data/interim/ris_ipv6_top_level_prefixes.csv`、`runs/calibration-native-v1/effective_calibration_targets.csv`。本机也没有 `.build/zmap-build/src/zmap`；Linux 构建状态未在本轮核实。RIS 快照身份不是运行条件。
+
+运行规模仍有限制：`Targets.used`、策略观测与前缀状态均常驻内存；续跑时必须从已压缩批次的真实解析结果重建这些状态，启动时间随已完成探针数增长。单次 SIGINT/SIGTERM 会在当前批次归档后暂停；若进程在批次中途被强制终止，可能已有探针发出，不能自动重发该批。在示例 `rate_pps=1000`、`batch_size=8192`、每批 `cooldown_seconds=30` 下，即使降至 5B，仅发送与冷却的理论时间仍约 **270 天/方法**，还不包括计算、解析和主机故障时间。`budget_total_per_method` 是独立上限；策略若没有下一批候选，会提前结束，代码不保证每种方法恰好用满 5B。TNet 尚未实现，三方比较也不能执行。
+
+### Linux 上的调用方式（完成上述运行条件后）
+
+从 `/root/BEP-A64-measurement/` 执行；配置中的相对路径均相对于配置文件所在目录解析。先将工作区的 `strategies/`、`scripts/run_formal.py`、`scripts/analyze_formal.py`、更新后的 `scripts/parse_results.py` 和 `formal.example.json` 同步到 Linux 项目根目录，保留已有的 `scripts/run_scan.sh`、`scripts/prepare_campaign.py` 和 `scripts/count_prefix_nesting.py`。Windows PowerShell 的文件传输命令如下：
+
+```powershell
+Set-Location D:\codex_workplace\kuokan\measurement
+scp -r .\strategies root@meta-codes-1:/root/BEP-A64-measurement/
+scp .\scripts\run_formal.py .\scripts\analyze_formal.py .\scripts\parse_results.py root@meta-codes-1:/root/BEP-A64-measurement/scripts/
+scp .\formal.example.json root@meta-codes-1:/root/BEP-A64-measurement/
+```
+
+若 ZMap 尚未构建，按下文第 3.1 节在 Linux 构建。复制示例配置为 `formal.json`，按测量主机现状设置源 IPv6、接口、有限速率和新的 `output_root`。不要沿用已存在的方法输出目录。
+
+```bash
+cd /root/BEP-A64-measurement
+cp formal.example.json formal.json
+# 编辑 formal.json：扫描接口/源地址/速率、独立输出目录
+sudo python3 scripts/run_formal.py formal.json journal
+sudo python3 scripts/run_formal.py formal.json subrecon
+python3 scripts/analyze_formal.py formal.json
+```
+
+需要有序暂停时，对 runner 发送一次 SIGINT（终端 Ctrl+C）或 SIGTERM，等待当前批次完成压缩，输出 `status: paused` 后再退出。只从已归档批次续跑，命令为：
+
+```bash
+sudo python3 scripts/run_formal.py formal.json journal --resume
+sudo python3 scripts/run_formal.py formal.json subrecon --resume
+```
+
+续跑使用与首次运行内容相同的 `formal.json`；已存在 `summary.json` 表示方法已完成，不能续跑。每批工作目录为 `batch-<九位序号>.work/`，成功归档为同名 `.tar.gz` 后才删除工作目录。压缩期间需同时容纳本批原文件和压缩包。若遗留 `.work/` 或 `.tar.gz.part`，程序拒绝自动续跑：先检查该批的 ZMap 命令、日志及原始结果，确认实际发包范围后人工处理，避免重复探测。
+
+这三个命令分别运行期刊方法、运行 SubRecon、汇总已完成的方法；前两个命令会**实际向公网发包**，不是预览。分析器按 `formal.json` 中 `strategies` 的全部方法读取 `summary.json`，任一方法未完成时不应执行汇总。期刊方法读取完整 `ris_ipv6_prefixes_unique.csv` 并在内存构树；SubRecon 只读取 `ris_ipv6_top_level_prefixes.csv`。两者应用 `config/frame_exclusions.txt` 的 6to4 帧排除，共用 D050 search `/64` 清单仅作新目标去重，不读取旧响应标签。每方法 5B 独立记账；期刊方法的历史 149,652 探针占其总预算，正式阶段上限为 4,999,850,348。每批压缩包保留目标清单、实际命令与 ZMap 版本、原始与解析结果、该批 `ledger.csv` 及末跳源地址证据；方法结束后目录留下 `summary.json`、按需生成的 `native-prefixes.txt.gz` 和去重的 `last-hop-routers.txt.gz`。分析器另写 `comparison.csv` 和 `cost-discovery-curve.csv.gz`。
+
 开始实现前，先按顺序读共享记忆（`project_memory/` 下）：`AGENTS.md` → `PROJECT_CONTEXT.md` → `DECISIONS.md` → `PROGRESS.md` → `TODO.md`。本 runbook 是这些记忆的"测量工程化"摘录，不替代它们。
 
 ---
@@ -10,7 +57,7 @@
 
 **已完成**：从 BGP 输入到逐轮解析的整条校准管线（prepare → run → parse → analyze），并在服务器上跑完了 D050 六轮校准（149,652 个探针，24,942 个 panel）。
 
-**待办**：正式的**全树等总预算三方对比**（journal 方法 vs 论文版 TNet vs ICNP 会议版 SubRecon）还**没有实现**。现有 `campaign.json` / `analyze_campaign.py` 仍是"校准专用"，不是三方动态搜索的正式 runner。
+**待办**：正式的**全树等总预算三方对比**（journal 方法 vs 论文版 TNet vs ICNP 会议版 SubRecon）尚未完成。`campaign.json` / `analyze_campaign.py` 是校准专用；正式 runner 目前只接入 journal 与 SubRecon。示例配置现为每方法 5B；批次边界可续跑，但 5B 规模的内存与重放成本、批次中途意外中断的恢复，以及 TNet 实现仍待解决。
 
 ---
 
@@ -23,7 +70,7 @@
   则记该 `/64` 为一次"活跃子网发现（active-subnet discovery）"。其它结果（含 timeout）都不是发现。
 - **正式任务**：在**固定总探针预算**下，最大化发现的**不同 IMC 阳性 `/64` 数量**。
 - **对比对象（D066/D068）**：journal 方法、**论文版 TNet**（本地重实现，`/48` 候选筛选计入其预算）、**ICNP 会议版 SubRecon 的 BGP-only 策略改编**（无外部 Hitlist / 活跃种子 / 末跳路由器种子）。PaS、原始 BEP、random **不是**必跑基线。
-- **三方法共同起点（D068）**：同一份冻结的去重 RIS BGP 前缀帧 + 相同的 scan 排除 + 相同的 IMC 响应规则。从 BGP 建前缀树是离线计算，**不花探针**。
+- **三方法共同起点（D068，按本轮约束实施）**：同一份冻结的去重 RIS BGP 前缀帧、相同的 6to4 帧排除和 IMC 响应规则；正式运行不使用 scan 排除表。从 BGP 建前缀树是离线计算，**不花探针**。
 - **D050 的 149,652 探针归属**：是本项目方法自己的**历史校准/设计成本**，只记到我们这边，**不共享给 TNet/SubRecon，也不用其响应初始化正式搜索**。
 - **明确的非目标（D058-D061）**：不做 terminal audit、不做 missed-mass/Horvitz-Thompson/Neyman 估计、不做 parent-mass/完整性理论证明、不做 held-out 评价、不做 action trace、不做 soft-pruning 对比、不做 response-homogeneous block。这些都不是前置门槛。
 
@@ -31,13 +78,13 @@
 
 ## 2. 服务器环境与关键路径
 
-服务器：`root@meta-codes-1`，工作根目录 `/root/BEP-A64-measurement/`（下文相对路径都以它为根）。
+D050 记录的服务器为 `root@meta-codes-1`，工作根目录 `/root/BEP-A64-measurement/`（下文相对路径都以它为根）；本轮未连接主机核实其当前状态。
 
 | 对象 | 路径 |
 |---|---|
 | BGP 前缀输入（三列 CSV） | `data/interim/ris_ipv6_prefixes_unique.csv` |
 | frame 排除（6to4） | `config/frame_exclusions.txt`（内容 `2002::/16`） |
-| scan 排除（denylist） | `config/scan_exclusions.txt`（当前为空，仅注释） |
+| D050 校准历史使用的 scan 排除 | `config/scan_exclusions.txt`（正式 runner 不读取） |
 | **已生成的 bgp_tree.csv** | `runs/calibration-plan-native-v1/bgp_tree.csv` |
 | frame_roots.csv | `runs/calibration-plan-native-v1/frame_roots.csv` |
 | calibration_units.csv | `runs/calibration-plan-native-v1/calibration_units.csv` |
@@ -141,7 +188,7 @@ python3 scripts/prepare_campaign.py \
 
 **IID 生成**：`IID = first_64_bits(SHA256(target_seed || c64 || role || index))`，search/reference IID 互斥，六轮分别按 hash 全局重排。
 
-### 4.2 `run_campaign.py` — 正式薄 runner（校准专用，已完成）
+### 4.2 `run_campaign.py` — 校准专用 runner（已完成）
 
 ```bash
 sudo python3 scripts/run_campaign.py campaign.json search   # 每轮一次
@@ -284,13 +331,19 @@ root_stratum, tranche
 - 逐轮 parser + 多响应折叠 + calibration 分析器。
 - D050 六轮已跑完并分析（D052：`m=1..5` 饱和 1695/1809/1847/1866/1877；search 召回 92.5%；guided 富集 3.75×；1000ms 阈值稳健）。
 
-### 待办（正式三方法对比，**尚未实现**）
+### 已写入但尚未在 Linux 运行的正式代码
 
-1. **journal 方法**（D061-D063）：保留 BEP 前缀树 + parent 级 Beta–Bernoulli 更新 + parent-to-child prior；HD-Ratio base 配额 `k_base = min(2^(64-ell), max(1, ceil(theta_B * 2^((56-ell)/4))))`，`/64` 配额 1；`theta_B` 从正式预算一次性选定；base 之后按 expected discovery + 信息增益加探针；混合深度 frontier 调度；跨层 `/64` 探针去重（已探过的 `/64` 不再作为后续目标）。
-2. **TNet**：无开源实现，本地按论文重实现，`/48` 候选筛选计入其预算。
-3. **ICNP 会议 SubRecon BGP-only 改编**：无外部 Hitlist/活跃种子/末跳路由器种子，只从 BGP 前缀出发，扩展仅用其自己已付费发现的地址/路由器。
-4. **正式配置**：冻结各 collector RIS 快照身份、scan 排除、有限速率、每方法严格总预算 `B_total` 与阶段分配。
-5. **成本台账**：D050 149,652 探针只记到本方法；TNet 的 `/48` 筛选记到 TNet；SubRecon 的所有探针记到 SubRecon；只统计新付费阶段发现的 IMC 阳性 `/64`，D050 历史阳性单独披露、不算新发现。
+- `scripts/run_formal.py`：按配置动态加载 `strategies.<method>`，每方法独立发包、解析、累计台账；不读取 scan 排除表。
+- `strategies/journal.py`：从完整去重 RIS 前缀 CSV 构树，执行 HD 配额与动态搜索；D050 search `/64` 仅用于避免重复发包。
+- `strategies/subrecon.py`：从顶层前缀 CSV 出发，使用仓库 `src/budget.c` 的探针表与本方法反馈逐步细分；不接入外部 Hitlist。
+- `scripts/analyze_formal.py`：读取配置中的全部已完成方法，输出 `comparison.csv` 和 `cost-discovery-curve.csv.gz`。
+
+### 待办（正式三方法对比）
+
+1. **运行能力**：批次边界已可续跑；5B 规模的内存状态、逐目标计算成本，以及批次中途意外中断的人工核对仍需解决，再考虑长时正式扫描。
+2. **TNet**：其代码未开源，现有论文描述不足以唯一确定数值策略；后续实现 `strategies/tnet.py`，其 `/48` 筛选探针计入 TNet 自身的预算。
+3. **正式配置**：按 Linux 主机实际网络设置源地址、接口和有限速率；无需 RIS 快照身份和 scan 排除表。
+4. **正式测量与对比**：每方法独立核算；D050 149,652 探针只记入期刊方法，D050 历史阳性不算新发现。当前 runner 可在策略提前结束时少于 5B，不能据此宣称完成等成本对比。
 
 ### 明确的非目标（不要实现）
 
@@ -309,8 +362,119 @@ terminal audit / missed-mass / HT-Neyman / parent-mass 理论 / 完整性下界 
 
 ---
 
-## 10. 给接手者的三条落地提醒
+## 10. 数据流与文件依赖
 
-1. 现有 `prepare_campaign.py`/`run_campaign.py`/`parse_results.py`/`analyze_campaign.py` 是**校准管线**，是正式 runner 的工程模板，但**不能直接当三方法动态搜索 runner 用**（PROGRESS.md 已明示）。
-2. 正式 runner 需要**每方法独立搜索状态 + 每阶段实际发包台账 + IMC 阳性 `/64` 去重 + 累计成本/发现曲线**；从共同 BGP 前缀帧出发，不继承 D050 响应标签。
-3. 遵守最小代码纪律：存在优先、复用优先、标准库优先，不建框架/数据库/任务队列/配置 schema；每个脚本一个职责。
+```text
+（D050 时一次性获取的输入；正式运行沿用同一冻结文件）
+download_ris.sh → extract_ris_prefixes.sh → dedup_ris_prefixes.sh
+        └──────────────────────────► data/interim/ris_ipv6_prefixes_unique.csv
+
+data/interim/ris_ipv6_prefixes_unique.csv（冻结输入，三列 prefix,origin_count,origins）
+   │
+   ├─► extract_top_level_prefixes.py ──► data/interim/ris_ipv6_top_level_prefixes.csv
+   │                                       （顶层非重叠前缀 = SubRecon BGP-only 起点）
+   │
+   └─► prepare_campaign.py ──► runs/calibration-plan-native-v1/
+   │        （依赖 count_prefix_nesting.build_immediate_parent_map）
+   │        ├─ bgp_tree.csv
+   │        ├─ frame_roots.csv
+   │        ├─ summary.json
+   │        ├─ calibration_units.csv
+   │        ├─ calibration_targets.csv
+   │        └─ targets-search.txt / targets-reference-1..5.txt
+   │
+   │     campaign.json + config/scan_exclusions.txt
+   │        │
+   │        ▼
+   └─► run_campaign.py（校准专用 runner）
+           ├─ runs/calibration-native-v1/effective_calibration_targets.csv
+           ├─ runs/calibration-native-v1/excluded_panels.csv
+           └─ runs/calibration-native-v1/<round>/sent-targets-<round>.txt
+                │（bash run_scan.sh，调 .build/zmap-build/src/zmap）
+                ▼
+              runs/calibration-native-v1/<round>/raw-<round>.csv
+              （同目录 + .command.txt / .scanner-version.txt / campaign.json 快照）
+                │
+              parse_results.py
+                ▼
+              runs/calibration-native-v1/<round>/probes-<round>.csv
+              （同目录 + probes-<round>.csv.summary.json）
+                │
+              analyze_campaign.py（校准专用）
+                ▼
+              runs/calibration-native-v1/analysis/panel_labels.csv
+              runs/calibration-native-v1/analysis/summary.json
+```
+
+**关键依赖**：`count_prefix_nesting.py` 的 `build_immediate_parent_map()` 被 `prepare_campaign.py` 和 `extract_top_level_prefixes.py` 共同 import；`run_campaign.py` 通过 `bash run_scan.sh` 发包；`parse_results.py` 读 `run_campaign.py` 写的 effective manifest + `run_scan.sh` 写的 raw；`analyze_campaign.py` 读六轮 probes + effective manifest + units + `campaign.json`。
+
+**正式运行路径**：`formal.json` → `run_formal.py` 动态加载 `strategies/journal.py` 或 `strategies/subrecon.py` → `run_scan.sh` 实际发包 → `parse_results.py` 解析 → 策略接收反馈 → 每批归档包含 `ledger.csv` 的 `.tar.gz` → 方法完成时写 `summary.json` → 全部配置方法完成后由 `analyze_formal.py` 汇总。正式运行不调用 `run_campaign.py`，也不读取校准的 scan 排除表。
+
+## 11. 文件与代码清单（每个文件是什么 + 生命周期）
+
+| 文件 | 内容 | 生命周期 |
+|---|---|---|
+| `scripts/build_zmap.sh` | 从 vendored ZIP + 4 补丁构建 ZMap → `.build/zmap-build/src/zmap` | 活跃（构建）|
+| `scripts/run_scan.sh` | 拼装并执行 ZMap 命令（8 个位置参数） | 活跃（扫描包装，正式测量仍用）|
+| `scripts/parse_results.py` | 逐轮解析：raw→probes，RTT、响应类、timeout、多响应折叠 | 活跃（可复用）|
+| `scripts/prepare_campaign.py` | BGP 树/顶层根/整根划分/D050 校准目标生成 | 核心可复用；D050 目标生成是校准专用（正式搜索全树、不划根）|
+| `scripts/extract_top_level_prefixes.py` | 剥离父子、只留顶层前缀，输出 SubRecon 起点文件 | 活跃（新加）|
+| `scripts/run_campaign.py` | 校准专用固定 panel runner（历史 denylist 整 panel 排除 + 调 run_scan.sh） | 校准专用 |
+| `scripts/analyze_campaign.py` | 校准专用分析（panel_labels + 六类汇总） | 校准专用 |
+| `scripts/run_formal.py` | 按配置加载策略、调用 ZMap 与解析器、写每方法探针台账 | 已写入；Linux 未运行；支持已归档批次续跑 |
+| `scripts/analyze_formal.py` | 读取配置中方法的完成汇总与 ledger，生成成本发现表 | 已写入；Linux 未运行 |
+| `strategies/common.py`、`journal.py`、`subrecon.py` | 共用前缀帧和目标抽取；期刊与 SubRecon 各自搜索策略 | 已写入；状态常驻内存 |
+| `scripts/count_prefix_nesting.py` | 一次性嵌套统计诊断；提供 `build_immediate_parent_map()` | `main()` 一次性；函数被复用 |
+| `scripts/download_ris.sh` | 下载 RIPE RIS `latest-bview.gz` | 一次性（输入已冻结）|
+| `scripts/extract_ris_prefixes.sh` | `bgpdump` 抽取 + 合并 IPv6 prefix/origin | 一次性 |
+| `scripts/dedup_ris_prefixes.sh` | 多 collector 去重为一行一前缀 | 一次性 |
+| `campaign.json` | 校准配置（seed、panel、scanner、阈值、路径） | 校准专用 |
+| `formal.example.json` | 每方法 5B 上限、正式输入、策略与扫描参数示例 | 已写入；复制为 `formal.json` 后填写实际运行信息 |
+| `config/frame_exclusions.txt` | `2002::/16` 排除 | 活跃 |
+| `config/scan_exclusions.txt` | D050 校准历史的 scan denylist | 正式 runner 不使用 |
+| `patches/0001..0004` | ZMap 4 个定点补丁（cmake / gengetopt / ipv6-ethertype / echo-field） | 活跃（构建）|
+| `vendor/aim_zmap_reqnr_single.zip` | vendored ZMap 源（SHA 固定） | 活跃（构建源）|
+| `README.md` / `UPSTREAM_AUDIT.md` | 测量运行时说明 / 上游复用审计 | 文档 |
+| `vendor/README.md` / `strategies/README.md` | vendor 说明 / 当前策略接口 | 文档 |
+
+**已经失效 / 被取代，不要再去实现或查找的**（来自记忆，非代码）：
+
+- D046 的 `/32` 切根实现 → 已废止，顶层 BGP 前缀才是搜索根；
+- D054 的 action trace → 被 D061 取代，**不需要**；
+- soft pruning / `defer` → 被 D061 从核心移除；
+- terminal audit / missed-mass / HT-Neyman → 被 D059 移除；
+- response-homogeneous block → 被 D061 移除；
+- held-out 评价 → 被 D067 移除；
+- `P_D/P_ND/N_R/U_T/U_C` 词汇 → 历史（D039 后不再用）；
+- 早期 `100 /52 PSUs × 256 A64s` 设计 → 已取代（D032 直接抽 C64）。
+
+## 12. 生成文件清单（文件名 + 内容）
+
+| 生成文件 | 内容 | 由谁生成 |
+|---|---|---|
+| `data/interim/ris_ipv6_top_level_prefixes.csv` | 顶层非重叠前缀（三列，SubRecon 起点） | extract_top_level_prefixes.py |
+| `runs/calibration-plan-native-v1/bgp_tree.csv` | 每 BGP 前缀一行：parent/root/depth/children/descendants | prepare_campaign.py |
+| `runs/calibration-plan-native-v1/frame_roots.csv` | 每顶层根一行：特征 + routed_c64_count | prepare_campaign.py |
+| `runs/calibration-plan-native-v1/summary.json` | 结构计数（前缀/嵌套/顶层/C64 质量） | prepare_campaign.py |
+| `runs/calibration-plan-native-v1/calibration_units.csv` | 每 panel 一行：arm + 入样概率 | prepare_campaign.py |
+| `runs/calibration-plan-native-v1/calibration_targets.csv` | 每目标一行：6 轮 manifest（probe_id/panel/c64/target/role/round） | prepare_campaign.py |
+| `runs/calibration-plan-native-v1/targets-*.txt` | 每轮已 hash 洗牌的目标地址（一行一个） | prepare_campaign.py |
+| `runs/calibration-native-v1/effective_calibration_targets.csv` | denylist 过滤后的 manifest | run_campaign.py |
+| `runs/calibration-native-v1/excluded_panels.csv` | 被 denylist 排除的 panel | run_campaign.py |
+| `runs/calibration-native-v1/<round>/sent-targets-<round>.txt` | 本轮实际发送目标 | run_campaign.py |
+| `runs/calibration-native-v1/<round>/campaign.json` | 配置快照 | run_campaign.py |
+| `runs/calibration-native-v1/<round>/raw-<round>.csv` | ZMap 原始输出（15 字段） | run_scan.sh |
+| `runs/calibration-native-v1/<round>/raw-<round>.csv.command.txt` | 实际 ZMap 命令 | run_scan.sh |
+| `runs/calibration-native-v1/<round>/raw-<round>.csv.scanner-version.txt` | ZMap 版本 | run_scan.sh |
+| `runs/calibration-native-v1/<round>/probes-<round>.csv` | 每探针一行：plan 字段 + 响应类/RTT/source/状态 | parse_results.py |
+| `runs/calibration-native-v1/<round>/probes-<round>.csv.summary.json` | 本轮 matched/timeout/unmatched/多响应计数 | parse_results.py |
+| `runs/calibration-native-v1/analysis/panel_labels.csv` | 每 panel 一行：search 响应类 + search 阳性 + reference_positive_m1..m5 + source 数 | analyze_campaign.py |
+| `runs/calibration-native-v1/analysis/summary.json` | 六类结果 + validation | analyze_campaign.py |
+
+正式方法另写 `runs/formal-journal-subrecon-5b-v1/<method>/`：`formal.json` 快照、完成后的 `summary.json`、`last-hop-routers.txt.gz`、按需生成的 `native-prefixes.txt.gz`，以及每批 `batch-<九位序号>.tar.gz`。压缩包包含 `targets.csv`、`target-metadata.csv`、`sent-targets.txt`、`raw-zmap.csv`、`raw-zmap.csv.command.txt`、`raw-zmap.csv.scanner-version.txt`、`probes.csv`、`probes.csv.summary.json`、`last-hop-router-observations.csv`、`scan.log` 和该批 `ledger.csv`。归档成功后删除对应 `.work/`。`analyze_formal.py` 在输出根目录写 `comparison.csv` 和 `cost-discovery-curve.csv.gz`。实际目录以 `formal.json` 的 `output_root` 为准。
+
+## 13. 给接手者的三条落地提醒
+
+1. `run_campaign.py` 与 `analyze_campaign.py` 只处理 D050 校准；正式调用 `run_formal.py` 与 `analyze_formal.py`。`parse_results.py` 为两条管线共用。
+2. 先解决 5B 规模的内存与重放成本、批次中途意外中断的人工核对和 TNet 缺位；现有正式代码只能说明两种策略的调用路径，不能说明已完成等预算实测。
+3. 遵守最小代码纪律：存在优先、复用优先、标准库优先；不为尚未发生的需求加框架或门槛。

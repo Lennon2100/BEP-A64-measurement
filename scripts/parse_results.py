@@ -64,6 +64,11 @@ OUTPUT_FIELDS = PLAN_FIELDS + [
     "raw_row_number",
 ]
 
+ROUTER_FIELDS = [
+    "probe_id", "c64", "target_ipv6", "router_ipv6", "response_class",
+    "rtt_ms", "raw_row_number",
+]
+
 
 def canonical_ipv6(text):
     address = ipaddress.ip_address(text.strip())
@@ -178,7 +183,7 @@ def unmatched_row(plan_row, raw_row, raw_row_number, threshold):
     return output
 
 
-def load_raw(path, plan, slow_au_threshold_ms):
+def load_raw(path, plan, slow_au_threshold_ms, router_rows=None):
     responses = defaultdict(list)
     unmatched = []
     with open(path, newline="", encoding="utf-8") as fh:
@@ -233,6 +238,16 @@ def load_raw(path, plan, slow_au_threshold_ms):
             output.update(raw_output_fields(row))
             output["quoted_target"] = target
             responses[target].append(output)
+            if router_rows is not None and icmp_type == 1 and icmp_code == 3 and row.get("saddr"):
+                router_rows.append({
+                    "probe_id": plan_row["probe_id"],
+                    "c64": plan_row["c64"],
+                    "target_ipv6": target,
+                    "router_ipv6": canonical_ipv6(row["saddr"]),
+                    "response_class": derived_class,
+                    "rtt_ms": output["rtt_ms"],
+                    "raw_row_number": line_number,
+                })
 
     observations = {}
     multi_response = []
@@ -281,20 +296,24 @@ def main(argv):
     parser.add_argument("raw_zmap_csv")
     parser.add_argument("output_csv")
     parser.add_argument("--slow-au-threshold-ms", type=int, default=1000)
+    parser.add_argument("--last-hop-router-output")
     args = parser.parse_args(argv)
 
     if args.slow_au_threshold_ms <= 0:
         parser.error("--slow-au-threshold-ms must be positive")
     summary_path = f"{args.output_csv}.summary.json"
-    for output in (args.output_csv, summary_path):
+    for output in (args.output_csv, summary_path, args.last_hop_router_output):
+        if output is None:
+            continue
         if os.path.exists(output):
             print(f"refusing to overwrite existing output: {output}", file=sys.stderr)
             return 1
 
     try:
         plan = load_plan(args.target_manifest, args.round)
+        router_rows = [] if args.last_hop_router_output else None
         observations, unmatched, multi_response = load_raw(
-            args.raw_zmap_csv, plan, args.slow_au_threshold_ms
+            args.raw_zmap_csv, plan, args.slow_au_threshold_ms, router_rows,
         )
         output_rows = [
             observations.get(target, timeout_row(plan_row, args.slow_au_threshold_ms))
@@ -308,6 +327,12 @@ def main(argv):
             writer = csv.DictWriter(fh, fieldnames=OUTPUT_FIELDS)
             writer.writeheader()
             writer.writerows(output_rows)
+
+        if args.last_hop_router_output:
+            with open(args.last_hop_router_output, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=ROUTER_FIELDS)
+                writer.writeheader()
+                writer.writerows(router_rows)
 
         status_counts = Counter(row["match_status"] for row in output_rows)
         class_counts = Counter(row["response_class"] for row in output_rows)

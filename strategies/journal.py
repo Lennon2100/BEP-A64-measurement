@@ -1,15 +1,22 @@
 """BEP-derived HD base allocation with lazy, mixed-depth Bayesian search."""
 
-import math
 import ipaddress
+import math
 from collections import defaultdict
+
+from strategies.common import Frame
+
+
+def load_frame(cfg, base):
+    inputs = cfg["input"]
+    return Frame.journal(base / inputs["journal_prefix_csv"], base / inputs["frame_exclusions"])
 
 
 class Strategy:
     name = "journal"
 
     def __init__(self, frame, targets, cfg, allowance):
-        self.frame, self.targets, self.cfg = frame, targets, cfg
+        self.frame, self.targets = frame, targets
         self.allowance = allowance
         self.theta = float(cfg["theta_b"])
         self.steps = tuple(cfg["step_bits"])

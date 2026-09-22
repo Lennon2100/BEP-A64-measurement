@@ -1,9 +1,12 @@
-"""Shared target generation and BGP frame for the three formal strategies."""
+"""Shared routed-frame loading and unique /64 target generation."""
 
 import csv
 import ipaddress
 import random
 from collections import defaultdict
+
+from scripts.count_prefix_nesting import build_immediate_parent_map
+from scripts.prepare_campaign import load_exclusions, load_rows, root_for
 
 
 def network(text):
@@ -18,79 +21,61 @@ def c64_of(address):
 
 
 class Frame:
-    def __init__(self, tree_csv):
-        self.roots = []
-        self.prefixes = []
+    def __init__(self, prefixes, parents):
+        self.prefixes = sorted(prefixes, key=lambda p: (int(p.network_address), p.prefixlen))
+        self.roots = sorted(set(prefixes) - set(parents), key=lambda p: int(p.network_address))
         self.prefixes_by_root = defaultdict(list)
-        self.descendants = {}
-        with open(tree_csv, newline="", encoding="utf-8") as fh:
+        self.descendants = {prefix: 0 for prefix in prefixes}
+        root_cache = {}
+        for prefix in prefixes:
+            self.prefixes_by_root[root_for(prefix, parents, root_cache)].append(prefix)
+        for prefix in sorted(prefixes, key=lambda p: p.prefixlen, reverse=True):
+            if prefix in parents:
+                self.descendants[parents[prefix]] += 1 + self.descendants[prefix]
+
+    @classmethod
+    def journal(cls, prefix_csv, frame_exclusions):
+        rows, _ = load_rows(prefix_csv, load_exclusions(frame_exclusions))
+        prefixes = set(rows)
+        return cls(prefixes, build_immediate_parent_map(prefixes))
+
+    @classmethod
+    def subrecon(cls, top_level_csv, frame_exclusions):
+        exclusions = load_exclusions(frame_exclusions)
+        prefixes = set()
+        with open(top_level_csv, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
                 prefix = network(row["prefix"])
-                root = network(row["root_prefix"])
-                if prefix in self.descendants or not prefix.subnet_of(root):
-                    raise ValueError(f"duplicate or inconsistent BGP prefix: {prefix}")
-                self.prefixes.append(prefix)
-                self.prefixes_by_root[root].append(prefix)
-                self.descendants[prefix] = int(row["descendant_prefix_count"])
-                parent = row["parent_prefix"]
-                if parent:
-                    parent_prefix = network(parent)
-                    if parent_prefix == prefix or not prefix.subnet_of(parent_prefix):
-                        raise ValueError(f"invalid BGP parent for {prefix}: {parent}")
-                else:
-                    if prefix != root:
-                        raise ValueError(f"invalid BGP root for {prefix}: {root}")
-                    self.roots.append(prefix)
-        if not self.roots:
-            raise ValueError("BGP tree has no roots")
-        self.roots.sort(key=lambda p: int(p.network_address))
+                if not any(prefix.subnet_of(exclusion) for exclusion in exclusions):
+                    prefixes.add(prefix)
+        return cls(prefixes, {})
 
 
 class Targets:
-    def __init__(self, seed, exclusions=(), prior_c64s=()):
+    def __init__(self, seed, prior_c64s=()):
         self.rng = random.Random(seed)
-        self.exclusions = tuple(exclusions)
         self.used = set(prior_c64s)
+        self.positions = {}
 
     def draw(self, prefix):
         count = 1 << (64 - prefix.prefixlen)
         start = int(prefix.network_address) >> 64
-        # The sequence is uniform without replacement within this request.
-        # A nearly exhausted node is walked deterministically at the end.
-        for _ in range(min(64, count)):
-            value = start + self.rng.randrange(count)
-            if value not in self.used and self._allowed(value):
+        if prefix not in self.positions:
+            offset = self.rng.randrange(count)
+            stride = 1 if count == 1 else 2 * self.rng.randrange(count // 2) + 1
+            self.positions[prefix] = [offset, stride, 0]
+        position = self.positions[prefix]
+        while position[2] < count:
+            value = start + ((position[0] + position[1] * position[2]) % count)
+            position[2] += 1
+            if value not in self.used:
                 self.used.add(value)
                 return value
-        if count <= 65536:
-            offset = self.rng.randrange(count)
-            for step in range(count):
-                value = start + (offset + step) % count
-                if value not in self.used and self._allowed(value):
-                    self.used.add(value)
-                    return value
         return None
 
-    def _allowed(self, c64):
-        prefix64 = ipaddress.ip_network((c64 << 64, 64))
-        return all(not prefix64.subnet_of(exclusion) for exclusion in self.exclusions)
-
     def address(self, c64):
-        # One fresh IID per formal /64, shared policy across methods.
-        for _ in range(64):
-            iid = self.rng.randrange(1, 1 << 64)
-            address = ipaddress.IPv6Address((c64 << 64) | iid)
-            if all(address not in prefix for prefix in self.exclusions):
-                return str(address)
-        raise ValueError(f"cannot choose an allowed IID in {ipaddress.ip_network((c64 << 64, 64))}")
-
-
-def read_prefixes(path):
-    with open(path, encoding="utf-8") as fh:
-        prefixes = [ipaddress.ip_network(line.split("#", 1)[0].strip(), strict=False) for line in fh if line.split("#", 1)[0].strip()]
-    if any(prefix.version != 6 for prefix in prefixes):
-        raise ValueError(f"scan exclusions include a non-IPv6 prefix: {path}")
-    return prefixes
+        iid = self.rng.randrange(1, 1 << 64)
+        return str(ipaddress.IPv6Address((c64 << 64) | iid))
 
 
 def read_prior_c64s(path):
