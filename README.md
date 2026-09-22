@@ -144,7 +144,9 @@ sudo ./scripts/run_scan.sh \
 Arguments are, in order: ZMap binary, ordered target file, output CSV, source
 IPv6 address, interface, gateway MAC, packets per second, and cooldown seconds.
 Use real authorized values on the Linux measurement host. The wrapper refuses to
-overwrite an existing raw result.
+overwrite an existing raw result. It passes the interface as `-i`, the actual
+IPv6 packet source as `--ipv6-source-ip`, and `-S 0.0.0.0` to bypass this fork's
+IPv4 interface-address lookup during an IPv6 scan.
 
 For a point-to-point IPv6 tunnel such as `ipv6net` (SIT/NOARP), pass `-` instead
 of a gateway MAC. The wrapper then uses ZMap's `--iplayer` mode. The build script

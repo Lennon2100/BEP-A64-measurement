@@ -32,6 +32,8 @@ class Strategy:
         self.active = {}
         self.closed = set()
         self.pending = []
+        # A new prefix opens only after the previous base quota is filled or exhausted.
+        self.base_node = None
         self.root_order = sorted(frame.roots, key=lambda p: (-frame.descendants[p], str(p)))
         self.root_index = 0
 
@@ -106,17 +108,22 @@ class Strategy:
         if self.pending:
             raise ValueError("feedback required before next batch")
         batch = []
-        planned_counts = defaultdict(int)
+        base_remaining = 0
+        if self.base_node is not None:
+            base_remaining = self.base(self.base_node) - self._counts(self.base_node)[2]
+            if base_remaining <= 0:
+                self.base_node = None
         while len(batch) < limit:
-            candidates = [p for p in self.active if p not in self.closed and self._counts(p)[2] + planned_counts[p] < self.base(p)]
-            if candidates:
-                node = max(candidates, key=self._score)
+            if self.base_node is not None:
+                node = self.base_node
             elif self.root_index < len(self.root_order) and len(self.observations) + len(batch) < self.allowance * self.root_fraction:
                 node = self.root_order[self.root_index]
                 self.root_index += 1
                 if self.base(node) > self.allowance - len(self.observations) - len(batch):
                     continue
                 self.active[node] = {"parent": None, "root": node}
+                self.base_node = node
+                base_remaining = self.base(node)
             else:
                 expandable = [p for p in self.active if p not in self.closed and p.prefixlen < 64]
                 if not expandable:
@@ -126,19 +133,23 @@ class Strategy:
                 unsatisfied = max(0, self.base(child) - self._prior_count(child, self.active[parent]["root"], batch)) if child else 0
                 if child is not None and child_score > self._score(parent) and unsatisfied <= self.allowance - len(self.observations) - len(batch):
                     self.active[child] = {"parent": parent, "root": self.active[parent]["root"]}
-                    planned_counts[child] = sum(ipaddress.IPv6Address(item["c64"] << 64) in child for item in batch)
                     node = child
+                    if unsatisfied:
+                        self.base_node = child
+                        base_remaining = unsatisfied
                 else:
                     node = parent
             c64 = self.targets.draw(node)
             if c64 is None:
                 self.closed.add(node)
+                if self.base_node == node:
+                    self.base_node = None
                 continue
             batch.append({"c64": c64, "node": str(node), "stage": "search"})
-            current = node
-            while current is not None:
-                planned_counts[current] += 1
-                current = self.active[current]["parent"]
+            if self.base_node == node:
+                base_remaining -= 1
+                if base_remaining <= 0:
+                    self.base_node = None
         self.pending = batch
         return batch
 

@@ -31,7 +31,7 @@
 | `strategies.journal.theta_b` | `1`；其余搜索系数见模板 |
 | `output_root` | `runs/formal-journal-subrecon-5b-v1`，首次运行应为空 |
 
-正式运行不读取 scan 排除表，也不要求 RIS 快照身份。Linux 主机需有上述两份 RIS CSV、frame 排除文件和已构建的 ZMap。ZMap 构建及扫描包装参数见 [README.md](README.md)。模板中的 1000 pps、8192 探针一批、每批 30 秒冷却意味着每方法 5B 探针仅发送与冷却的理论时间约 270 天；还未计计算、解析和停机时间。
+正式运行不读取 scan 排除表，也不要求 RIS 快照身份。Linux 主机需有上述两份 RIS CSV、frame 排除文件和已构建的 ZMap。扫描包装脚本向 ZMap 传入 `-i`、`--ipv6-source-ip`，并为此 fork 的 IPv4 初始化传入 `-S 0.0.0.0`；实际 IPv6 探针使用配置中的源 IPv6。ZMap 构建及扫描包装参数见 [README.md](README.md)。模板中的 1000 pps、8192 探针一批、每批 30 秒冷却意味着每方法 5B 探针仅发送与冷却的理论时间约 270 天；还未计计算、解析和停机时间。
 
 ## 启动、暂停、续跑
 

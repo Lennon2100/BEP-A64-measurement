@@ -30,12 +30,14 @@ fields="orig-dest-ip,classification,success,type,code,saddr,ttl,original_ttl,sen
 command=(
     "$zmap_binary"
     -M icmp6_echoscan_time
+    # This fork initializes an IPv4 source even for IPv6 scans; the packet source is below.
+    -S 0.0.0.0
     --ipv6-source-ip "$source_ipv6"
     --ipv6-target-file "$targets"
     --probes 1
     --rate "$rate_pps"
     --cooldown-time "$cooldown_seconds"
-    --interface "$interface"
+    -i "$interface"
     --output-module csv
     --output-fields "$fields"
     --output-filter "success = 0 || success = 1"
