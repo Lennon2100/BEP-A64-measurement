@@ -36,7 +36,9 @@ or an external Hitlist. `scripts/run_formal.py` runs one method through this bou
   intact roots and emits the first calibration C64/IID panel.
 - `scripts/run_scan.sh`: a strict, non-interactive wrapper around
   `icmp6_echoscan_time`.
-- `scripts/parse_results.py`: joins one raw ZMap round to the target manifest,
+- `scripts/parse_results.py`: joins one calibration ZMap round to its manifest.
+- `scripts/parse_formal_results.py`: streams a formal manifest while retaining
+  only the current batch's responses and compact node feedback in memory.
   computes RTT, derives the operational response class, and adds timeout rows.
   Formal runs also request matched Type 1 Code 3 AU source addresses before
   same-class multi-response folding.
@@ -44,12 +46,14 @@ or an external Hitlist. `scripts/run_formal.py` runs one method through this bou
 - `strategies/journal.py` and `strategies/subrecon.py`: the implemented
   formal search policies. TNet remains pending because its unpublished code
   and unspecified numerical policy do not determine a unique reproduction.
-- `scripts/run_formal.py`: the formal scan, parse, and cost-ledger loop.
-- `scripts/analyze_formal.py`: cost and discovery tables for configured methods.
+- `scripts/run_formal.py`: the formal scan/parse loop with streaming target
+  generation and compact cursor/node checkpoints (no archive replay).
+- `scripts/analyze_formal.py`: derives per-method cost/discovery curves from
+  each batch's `probes.csv`; no separate per-target ledger file is stored.
 
 `scripts/analyze_campaign.py` already aggregates the D050 reference labels and
 calibration results. The formal runner writes per-method cumulative cost and
-discovery ledgers; it does not combine them into a paper figure.
+discovery curves on demand; it does not combine them into a paper figure.
 
 ## Formal journal and SubRecon run
 
@@ -70,6 +74,18 @@ sudo python3 scripts/run_formal.py formal.json subrecon
 python3 scripts/analyze_formal.py formal.json
 ```
 
+**Feasibility.** At `rate_pps = 1000`, one probe costs 1 ms, so 5B probes are
+about 57.9 days of pure transmit time regardless of batching or cooldown; the
+30 s `--cooldown-time` is ZMap's receive tail (needed to capture slow-AU RTTs
+up to ~25 s), not a scheduling sleep. One ZMap invocation accepts one fixed
+target list and then receives for one tail, so the strategy feedback round and
+the scanner file batch are the same thing — there is no mid-scan target
+injection. The only lever is `batch_size`. The template's `batch_size` of
+1,000,000 keeps the tail overhead near 3% while updating the posterior about
+every 17 minutes; the 5B ceiling is therefore a config ceiling, not a promise
+that a single continuous run is practical. Size the first real run to days,
+not months, and raise `rate_pps` only with host/operator authorization.
+
 Start a method without `--resume` only when its output directory is absent.
 For a graceful stop, send SIGINT or SIGTERM once; the current batch finishes,
 is compressed, and the runner exits with `status: paused`. Continue it with:
@@ -79,38 +95,41 @@ sudo python3 scripts/run_formal.py formal.json journal --resume
 sudo python3 scripts/run_formal.py formal.json subrecon --resume
 ```
 
-Each completed batch is one `batch-000000001.tar.gz` archive containing the
-target manifest, ordered sent list, scanner command and version, raw ZMap CSV,
-parsed per-probe CSV, matched AU router observations, strategy metadata, and
-that batch's `ledger.csv`. The temporary `.work` directory is removed only after
-the archive has been written and read back. Compression temporarily needs space
-for both the working batch and its archive. An interrupted `.work` or `.tar.gz.part`
-batch blocks automatic resume because some probes may already have been sent;
-inspect its scan evidence before deciding what to do. Resume rebuilds strategy
-state from completed archives and their actual parsed responses, so its startup
-cost grows with the completed probe count. The configuration must match the
-recorded `formal.json`.
+Each completed batch is one `batch-000000001.tar.gz` archive containing a
+single `manifest.csv` (the ordered target table plus `node`/`mode`), scanner
+command and version, raw ZMap CSV, compact parsed per-probe evidence, node
+feedback, matched AU router observations, and the post-batch checkpoint. The temporary `.work`
+directory is removed only after the archive has been written and read back.
+Compression temporarily needs space for both the working batch and its
+archive. An interrupted `.work` or `.tar.gz.part` blocks
+automatic resume because some probes may already have been sent; inspect the
+scan evidence before deciding what to do.
+
+Resume reads the newest archive's `state.json` (per-node aggregates and
+deterministic generator cursors). It does **not** replay completed archives or
+load an accumulated probe set; startup and resident strategy state are
+O(active nodes). The configuration must match the recorded `formal.json`.
 
 Each method writes `last-hop-routers.txt.gz` with distinct observed AU source IPv6
 addresses; `summary.json` and `comparison.csv` report that count. These are
 candidate last-hop interface addresses, not verified router identities, and
-they do not change the discovery metric or seed a strategy. Each archived
-ledger records charged stages, cumulative targets in completed scan batches,
-and distinct newly observed IMC-positive `/64`s. Historical probes and target lists are not
-loaded into a formal method.
+they do not change the discovery metric or seed a strategy. Historical probes and
+target lists are not loaded into a formal method.
 
 The conference SubRecon adaptation starts from the top-level BGP prefixes,
 uses `thuname/subrecon`'s `src/budget.c` probe table, and refines using AU
 source diversity and response coverage. Its external Hitlist expansion phase
 is omitted. When present, native comparator prefixes are written to
 `native-prefixes.txt.gz` separately from the common positive `/64` count.
-`analyze_formal.py` writes `comparison.csv` and `cost-discovery-curve.csv.gz`.
+`analyze_formal.py` derives `comparison.csv` and `cost-discovery-curve.csv.gz`
+from each batch's `probes.csv`.
 
 To add TNet later, add `strategies/tnet.py` with `load_frame(config, base)`,
-`Strategy.next_batch(limit)`, and `Strategy.feedback(parsed_rows)`, then add
-its parameters under `strategies.tnet` in the configuration. The runner and
-analyzer select configured strategy names; TNet's `/48` screen probes must be
-reported as a charged stage by that strategy.
+`Strategy.iter_targets(limit)`, `Strategy.feed_aggregate(...)`,
+`Strategy.finish_batch()`, and `snapshot()/restore()`, then add its parameters
+under `strategies.tnet` in the configuration. The runner and analyzer select
+configured strategy names; TNet's `/48` screen probes must be reported as a
+charged stage by that strategy.
 
 ## Linux build
 

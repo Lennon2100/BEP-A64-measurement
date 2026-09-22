@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Combine completed strategy ledgers into cost and discovery tables."""
+"""Combine completed strategy runs into cost and discovery tables.
+
+The cost curve is derived from each batch's `probes.csv` (parsed rows are in
+manifest order and carry `is_observed_positive`); no separate ledger file is
+stored.
+"""
 
 import argparse
 import csv
@@ -7,33 +12,31 @@ import gzip
 import io
 import json
 import tarfile
-from heapq import merge
-from itertools import groupby
 from pathlib import Path
 
 
-def ledger_rows(method_dir):
+def planned_probes(method_dir):
+    """Yield `is_observed_positive` for each planned target, in send order."""
     for archive in sorted(method_dir.glob("batch-*.tar.gz")):
         with tarfile.open(archive, "r:gz") as bundle:
-            with bundle.extractfile("ledger.csv") as raw:
-                with io.TextIOWrapper(raw, encoding="utf-8", newline="") as fh:
-                    yield from csv.DictReader(fh)
+            with bundle.extractfile("probes.csv") as raw:
+                reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8", newline=""))
+                for row in reader:
+                    yield row["is_observed_positive"] == "1"
 
 
 def cost_curve(method_dir, summary, interval):
-    sent = summary["formal_sent"]
-    budget = summary["budget_total"]
-    checkpoints = (cost for cost, _ in groupby(merge(range(0, budget + 1, interval), (sent,))))
-    iterator = iter(ledger_rows(method_dir))
-    upcoming = next(iterator, None)
+    method = summary["method"]
+    probe = 0
     positives = 0
-    for ceiling in checkpoints:
-        if ceiling > sent:
-            break
-        while upcoming is not None and int(upcoming["probe_number"]) <= ceiling:
-            positives = int(upcoming["distinct_positive"])
-            upcoming = next(iterator, None)
-        yield {"method": summary["method"], "probe_cost": ceiling, "distinct_new_positive_c64": positives}
+    for positive in planned_probes(method_dir):
+        probe += 1
+        if positive:
+            positives += 1
+        if probe % interval == 0:
+            yield {"method": method, "probe_cost": probe, "distinct_new_positive_c64": positives}
+    if probe % interval:
+        yield {"method": method, "probe_cost": probe, "distinct_new_positive_c64": positives}
 
 
 def main():
@@ -44,26 +47,36 @@ def main():
     if args.curve_interval <= 0:
         parser.error("--curve-interval must be positive")
     config_path = Path(args.formal_config).resolve()
-    with config_path.open(encoding="utf-8") as fh:
-        config = json.load(fh)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     root = Path(config["output_root"])
     if not root.is_absolute():
         root = config_path.parent / root
+
     summaries = []
     for method in config["strategies"]:
-        with (root / method / "summary.json").open(encoding="utf-8") as fh:
-            summary = json.load(fh)
-        summaries.append(summary)
+        summaries.append(json.loads((root / method / "summary.json").read_text(encoding="utf-8")))
+
     comparison_path = root / "comparison.csv"
     curve_path = root / "cost-discovery-curve.csv.gz"
     if comparison_path.exists() or curve_path.exists():
         raise FileExistsError("refusing to overwrite formal comparison")
+
+    fields = (
+        "method", "budget_total", "formal_sent", "budget_exhausted",
+        "distinct_new_positive_c64", "distinct_last_hop_router_addresses",
+        "probes_per_new_discovery", "stages",
+    )
     with comparison_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=("method", "budget_total", "formal_sent", "budget_exhausted", "distinct_new_positive_c64", "distinct_last_hop_router_addresses", "probes_per_new_discovery", "stages"))
+        writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         for summary in summaries:
             discoveries = summary["distinct_new_positive_c64"]
-            writer.writerow({**{key: summary[key] for key in ("method", "budget_total", "formal_sent", "budget_exhausted", "distinct_new_positive_c64", "distinct_last_hop_router_addresses")}, "probes_per_new_discovery": summary["formal_sent"] / discoveries if discoveries else "", "stages": json.dumps(summary["stages"], sort_keys=True)})
+            writer.writerow({
+                **{key: summary[key] for key in fields if key != "probes_per_new_discovery" and key != "stages"},
+                "probes_per_new_discovery": summary["formal_sent"] / discoveries if discoveries else "",
+                "stages": json.dumps(summary["stages"], sort_keys=True),
+            })
+
     with gzip.open(curve_path, "wt", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=("method", "probe_cost", "distinct_new_positive_c64"))
         writer.writeheader()

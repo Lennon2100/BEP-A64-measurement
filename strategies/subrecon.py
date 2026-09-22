@@ -1,10 +1,13 @@
 """BGP-only ICNP SubRecon delimitation, using its published probe table.
 
 The external Hitlist-driven expansion phase is omitted: no activity-bearing
-seed is available under the common BGP-only input rule.
+seed is available under the common BGP-only input rule.  Per-prefix aggregates
+(sent, replies, distinct AU sources) replace the earlier root-range scans, so
+state is O(active prefixes); each /64 is attributed to the exact prefix that
+drew it.
 """
 
-import bisect
+import ipaddress
 from collections import deque
 
 from strategies.common import Frame
@@ -32,64 +35,105 @@ class Strategy:
     name = "subrecon"
 
     def __init__(self, frame, targets, cfg, allowance):
+        self.frame = frame
         self.targets = targets
+        self.allowance = allowance
+        self.sent = 0
+        self.positive_count = 0
         self.queue = deque(sorted(frame.prefixes, key=lambda p: (p.prefixlen, str(p))))
-        self.records_by_root = {root: {} for root in frame.roots}
-        self.roots = frame.roots
-        self.root_starts = [int(root.network_address) >> 64 for root in frame.roots]
-        self.pending = []
+        self.seen = set(frame.prefixes)
+        self.nodes = {}            # prefix -> {"parent", "sent", "replies", "sources"}
         self.native_prefixes = []
-        self.seen_nodes = set(frame.prefixes)
 
-    def _rows_in(self, prefix):
-        start = int(prefix.network_address) >> 64
-        end = start + (1 << (64 - prefix.prefixlen))
-        root_index = bisect.bisect_right(self.root_starts, start) - 1
-        return [row for c64, row in self.records_by_root[self.roots[root_index]].items() if start <= c64 < end]
+    def _activate(self, prefix, parent=None):
+        self.nodes[prefix] = {
+            "parent": parent, "sent": 0, "replies": 0, "sources": set(), "closed": False
+        }
 
     def _finish(self, prefix):
-        rows = self._rows_in(prefix)
-        sources = {row["icmp_source"] for row in rows if row["response_class"] in ("slow_au", "fast_au") and row["icmp_source"]}
-        replies = sum(row["response_class"] in ("slow_au", "fast_au", "direct") for row in rows)
+        rec = self.nodes[prefix]
         quota = PROBE_TABLE[prefix.prefixlen]
-        if len(sources) == 1 and (prefix.prefixlen == 64 or replies > 0.9 * quota):
+        if len(rec["sources"]) == 1 and (prefix.prefixlen == 64 or rec["replies"] > 0.9 * quota):
             self.native_prefixes.append(str(prefix))
-        elif prefix.prefixlen < 64 and (len(sources) > 1 or (len(sources) == 1 and replies <= 0.9 * quota)):
+        elif prefix.prefixlen < 64 and (
+            len(rec["sources"]) > 1 or (len(rec["sources"]) == 1 and rec["replies"] <= 0.9 * quota)
+        ):
             for child in prefix.subnets(new_prefix=prefix.prefixlen + 1):
-                if child not in self.seen_nodes:
+                if child not in self.seen:
                     self.queue.append(child)
-                    self.seen_nodes.add(child)
+                    self.seen.add(child)
+                    self._activate(child, prefix)
 
-    def next_batch(self, limit):
-        if self.pending:
-            raise ValueError("feedback required before next batch")
-        batch = []
-        selected_nodes = set()
-        while self.queue and len(batch) < limit:
+    def iter_targets(self, limit):
+        rounds = len(self.queue)
+        while limit > 0 and self.queue and rounds > 0:
+            rounds -= 1
             prefix = self.queue.popleft()
-            if prefix in selected_nodes:
-                self.queue.appendleft(prefix)
-                break
-            selected_nodes.add(prefix)
-            rows = self._rows_in(prefix)
-            sources = {row["icmp_source"] for row in rows if row["response_class"] in ("slow_au", "fast_au") and row["icmp_source"]}
-            remaining = PROBE_TABLE[prefix.prefixlen] - len(rows)
-            if len(sources) > 1 or remaining <= 0:
+            if prefix not in self.nodes:
+                self._activate(prefix)
+            rec = self.nodes[prefix]
+            quota = PROBE_TABLE[prefix.prefixlen]
+            if rec["closed"] or rec["sent"] >= quota or len(rec["sources"]) > 1:
                 self._finish(prefix)
                 continue
-            c64 = self.targets.draw(prefix)
-            if c64 is None:
-                self._finish(prefix)
-                continue
-            batch.append({"c64": c64, "node": str(prefix), "stage": "delimitation"})
+            ancestors = []
+            parent = rec["parent"]
+            while parent is not None:
+                ancestors.append(parent)
+                parent = self.nodes[parent]["parent"]
+            count = min(limit, quota - rec["sent"])
             self.queue.append(prefix)
-        self.pending = batch
-        return batch
+            for _ in range(count):
+                c64 = self.targets.draw(prefix, ancestors)
+                if c64 is None:
+                    rec["closed"] = True
+                    break
+                yield (c64, str(prefix), "delimitation")
+                limit -= 1
 
-    def feedback(self, rows):
-        if len(rows) != len(self.pending):
-            raise ValueError("SubRecon feedback size mismatch")
-        for item, row in zip(self.pending, rows):
-            index = bisect.bisect_right(self.root_starts, item["c64"]) - 1
-            self.records_by_root[self.roots[index]][item["c64"]] = row
-        self.pending = []
+    def feed_aggregate(self, node_str, mode, probes, positives, replies, sources):
+        rec = self.nodes[ipaddress.ip_network(node_str)]
+        rec["sent"] += probes
+        rec["replies"] += replies
+        rec["sources"].update(sources)
+        self.sent += probes
+        self.positive_count += positives
+
+    def finish_batch(self):
+        pass
+
+    def snapshot(self):
+        return {
+            "queue": [str(p) for p in self.queue],
+            "seen": [str(p) for p in self.seen],
+            "nodes": {
+                str(p): {
+                    "sent": rec["sent"],
+                    "parent": str(rec["parent"]) if rec["parent"] else None,
+                    "replies": rec["replies"],
+                    "sources": sorted(rec["sources"]),
+                    "closed": rec["closed"],
+                }
+                for p, rec in self.nodes.items()
+            },
+            "native_prefixes": self.native_prefixes,
+            "sent": self.sent,
+            "positive_count": self.positive_count,
+        }
+
+    def restore(self, state):
+        self.queue = deque(ipaddress.ip_network(p) for p in state["queue"])
+        self.seen = {ipaddress.ip_network(p) for p in state["seen"]}
+        self.nodes = {
+            ipaddress.ip_network(p): {
+                "parent": ipaddress.ip_network(rec["parent"]) if rec["parent"] else None,
+                "sent": rec["sent"],
+                "replies": rec["replies"],
+                "sources": set(rec["sources"]),
+                "closed": rec.get("closed", False),
+            }
+            for p, rec in state["nodes"].items()
+        }
+        self.native_prefixes = list(state["native_prefixes"])
+        self.sent = state["sent"]
+        self.positive_count = state["positive_count"]

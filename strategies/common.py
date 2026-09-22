@@ -1,4 +1,15 @@
-"""Shared routed-frame loading and unique /64 target generation."""
+"""Shared routed-frame loading and unique /64 target generation.
+
+A target is a /64 candidate; its full IPv6 address is the /64 prefix plus one
+random interface identifier.  Each prefix keeps a deterministic full-cycle
+permutation over its own /64 space.  Descendants reject candidates that occur
+before an ancestor's saved permutation cursor.  This gives exact cross-level
+deduplication from O(nodes) cursor state; strategies stop drawing from a parent
+after activating descendants.
+
+The generator state (`rng` + per-prefix permutation cursors) is snapshot/restore
+compatible so a run can resume without replaying completed batches.
+"""
 
 import csv
 import ipaddress
@@ -17,6 +28,8 @@ def network(text):
 
 
 class Frame:
+    """Immutable routed BGP frame: prefixes, non-overlapping roots, tree features."""
+
     def __init__(self, prefixes, parents):
         self.prefixes = sorted(prefixes, key=lambda p: (int(p.network_address), p.prefixlen))
         self.roots = sorted(set(prefixes) - set(parents), key=lambda p: int(p.network_address))
@@ -48,27 +61,87 @@ class Frame:
 
 
 class Targets:
-    def __init__(self, seed):
-        self.rng = random.Random(seed)
-        self.used = set()
-        self.positions = {}
+    """Deterministic, resume-compatible /64 target generator with exact dedup."""
 
-    def draw(self, prefix):
+    def __init__(self, seed):
+        self.seed = seed
+        self.rng = random.Random(seed)
+        self.positions = {}        # prefix -> [offset, stride, cursor]
+
+    def _position(self, prefix):
         count = 1 << (64 - prefix.prefixlen)
-        start = int(prefix.network_address) >> 64
         if prefix not in self.positions:
             offset = self.rng.randrange(count)
             stride = 1 if count == 1 else 2 * self.rng.randrange(count // 2) + 1
             self.positions[prefix] = [offset, stride, 0]
-        position = self.positions[prefix]
+        return self.positions[prefix]
+
+    def was_drawn(self, prefix, c64):
+        position = self.positions.get(prefix)
+        if position is None:
+            return False
+        count = 1 << (64 - prefix.prefixlen)
+        start = int(prefix.network_address) >> 64
+        relative = c64 - start
+        if not 0 <= relative < count:
+            return False
+        index = 0 if count == 1 else (
+            (relative - position[0]) * pow(position[1], -1, count)
+        ) % count
+        return index < position[2]
+
+    def drawn_values(self, prefix):
+        """Yield the /64 indices covered before this node's saved cursor."""
+        position = self.positions.get(prefix)
+        if position is None:
+            return
+        count = 1 << (64 - prefix.prefixlen)
+        start = int(prefix.network_address) >> 64
+        for index in range(position[2]):
+            yield start + ((position[0] + position[1] * index) % count)
+
+    def prior_count(self, prefix, ancestors):
+        """Count distinct earlier targets inside a newly activated descendant."""
+        start = int(prefix.network_address) >> 64
+        stop = start + (1 << (64 - prefix.prefixlen))
+        return len({
+            value
+            for ancestor in ancestors
+            for value in self.drawn_values(ancestor)
+            if start <= value < stop
+        })
+
+    def draw(self, prefix, ancestors=()):
+        """Return the next unprobed /64 in `prefix`'s permutation, or None."""
+        count = 1 << (64 - prefix.prefixlen)
+        start = int(prefix.network_address) >> 64
+        position = self._position(prefix)
         while position[2] < count:
             value = start + ((position[0] + position[1] * position[2]) % count)
             position[2] += 1
-            if value not in self.used:
-                self.used.add(value)
+            if not any(self.was_drawn(ancestor, value) for ancestor in ancestors):
                 return value
         return None
 
     def address(self, c64):
         iid = self.rng.randrange(1, 1 << 64)
         return str(ipaddress.IPv6Address((c64 << 64) | iid))
+
+    def snapshot(self):
+        """Compact generator state: RNG plus one permutation cursor per node."""
+        return {
+            "seed": self.seed,
+            "rng": self.rng.getstate(),
+            "positions": {str(p): list(v) for p, v in self.positions.items()},
+        }
+
+    def restore(self, state):
+        if state["seed"] != self.seed:
+            raise ValueError("target generator seed mismatch")
+        def tuples(value):
+            return tuple(tuples(item) for item in value) if isinstance(value, list) else value
+
+        self.rng.setstate(tuples(state["rng"]))
+        self.positions = {
+            ipaddress.ip_network(p): list(v) for p, v in state["positions"].items()
+        }

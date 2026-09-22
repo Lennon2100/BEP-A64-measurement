@@ -1,10 +1,29 @@
-"""BEP-derived HD base allocation with lazy, mixed-depth Bayesian search."""
+"""BEP-derived HD base allocation with lazy, mixed-depth Bayesian search.
 
+Block-level scheduling: one feedback round decides a plan of `(node, count)`
+actions in a single frontier pass, then streams targets.  No per-probe
+re-scoring.  Every probe is drawn uniformly within exactly one node (the
+action's node) and updates only that node's Beta counts; a probe drawn in a
+child is uniform in the child and is not a uniform sample of its ancestors.
+Cross-level reuse is automatic: a descendant's permutation skips /64s already
+drawn by an ancestor (dedup), so an ancestor's higher-level uniform probe is
+never re-sent and reduces the descendant's unsatisfied base by exactly the
+number of already-probed /64s that fall in it.
+
+State is O(active nodes); cross-level dedup is cursor-based (see Targets).  A
+"search layer" is one frontier scheduling round over nodes of possibly
+different absolute lengths.
+"""
+
+import heapq
 import ipaddress
 import math
-from collections import defaultdict
 
 from strategies.common import Frame
+
+
+def _entropy(q):
+    return 0.0 if q in (0.0, 1.0) else -q * math.log(q) - (1.0 - q) * math.log(1.0 - q)
 
 
 def load_frame(cfg, base):
@@ -16,7 +35,8 @@ class Strategy:
     name = "journal"
 
     def __init__(self, frame, targets, cfg, allowance):
-        self.frame, self.targets = frame, targets
+        self.frame = frame
+        self.targets = targets
         self.allowance = allowance
         self.theta = float(cfg["theta_b"])
         self.steps = tuple(cfg["step_bits"])
@@ -25,17 +45,35 @@ class Strategy:
         self.prior_decay = float(cfg["prior_decay"])
         self.bgp_weight = float(cfg["bgp_weight"])
         self.root_fraction = float(cfg["root_budget_fraction"])
-        if not (self.theta > 0 and self.prior_strength > 0 and 0 < self.prior_decay <= 1 and self.info_weight >= 0 and self.bgp_weight >= 0 and 0 < self.root_fraction < 1 and self.steps and all(1 <= step <= 8 for step in self.steps)):
-            raise ValueError("invalid journal search coefficients or step_bits")
-        self.observations = {}
-        self.records_by_root = defaultdict(dict)
-        self.active = {}
-        self.closed = set()
-        self.pending = []
-        # A new prefix opens only after the previous base quota is filled or exhausted.
-        self.base_node = None
+        self.action_block = int(cfg["action_block"])
+        if not (
+            self.theta > 0
+            and self.prior_strength > 0
+            and 0 < self.prior_decay <= 1
+            and self.info_weight >= 0
+            and self.bgp_weight >= 0
+            and 0 < self.root_fraction < 1
+            and self.action_block > 0
+            and self.steps
+            and all(1 <= step <= 8 for step in self.steps)
+        ):
+            raise ValueError("invalid journal search coefficients, action_block, or step_bits")
+
+        # Base and adaptive samples are kept separately.  Both are uniform in
+        # this node and therefore both are valid for its local likelihood.
+        self.nodes = {}
+        self.cache = {}          # prefix -> (alpha, beta, epoch) posterior memo
+        self.epoch = 0
+        self.heap = []           # (-score, seq, prefix) lazy-max heap
+        self.seq = 0
+        self.sent = 0
+        self.positive_count = 0
         self.root_order = sorted(frame.roots, key=lambda p: (-frame.descendants[p], str(p)))
         self.root_index = 0
+        self.root_phase_budget = allowance * self.root_fraction
+        self._touched = set()
+
+    # ---- quota and posterior -------------------------------------------------
 
     def base(self, prefix):
         if prefix.prefixlen == 64:
@@ -43,122 +81,243 @@ class Strategy:
         count = 1 << (64 - prefix.prefixlen)
         return min(count, max(1, math.ceil(self.theta * 2 ** ((56 - prefix.prefixlen) / 4))))
 
-    def _counts(self, prefix):
-        start = int(prefix.network_address) >> 64
-        stop = start + (1 << (64 - prefix.prefixlen))
-        root = self.active[prefix]["root"]
-        values = [y for c64, y in self.records_by_root[root].items() if start <= c64 < stop]
-        return sum(values), len(values) - sum(values), len(values)
-
-    def _prior_count(self, prefix, root, batch):
-        start = int(prefix.network_address) >> 64
-        stop = start + (1 << (64 - prefix.prefixlen))
-        return sum(start <= c64 < stop for c64 in self.records_by_root[root]) + sum(start <= row["c64"] < stop for row in batch)
-
     def _posterior(self, prefix):
-        parent = self.active[prefix]["parent"]
-        if parent is None:
+        rec = self.nodes[prefix]
+        hit = self.cache.get(prefix)
+        if hit is not None and hit[2] == self.epoch:
+            return hit[0], hit[1]
+        if rec["parent"] is None:
             a0 = b0 = self.prior_strength / 2
         else:
-            pa, pb = self._posterior(parent)
-            own_yes, own_no, _ = self._counts(prefix)
-            pa, pb = max(pa - own_yes, 0.01), max(pb - own_no, 0.01)
+            pa, pb = self._posterior(rec["parent"])
             mean = pa / (pa + pb)
-            strength = max(0.02, self.prior_strength * self.prior_decay ** (prefix.prefixlen - parent.prefixlen))
+            strength = max(
+                0.02,
+                self.prior_strength
+                * self.prior_decay ** (prefix.prefixlen - rec["parent"].prefixlen),
+            )
             a0, b0 = mean * strength, (1 - mean) * strength
-        yes, no, _ = self._counts(prefix)
-        return a0 + yes, b0 + no
+        alpha = rec["base_yes"] + rec["adaptive_yes"] + a0
+        beta = rec["base_no"] + rec["adaptive_no"] + b0
+        self.cache[prefix] = (alpha, beta, self.epoch)
+        return alpha, beta
 
     def _score(self, prefix):
         a, b = self._posterior(prefix)
         p = a / (a + b)
-        def entropy(q):
-            return 0 if q in (0, 1) else -q * math.log(q) - (1 - q) * math.log(1 - q)
-        information = entropy(p) - p * entropy((a + 1) / (a + b + 1)) - (1 - p) * entropy(a / (a + b + 1))
+        information = _entropy(p) - p * _entropy((a + 1) / (a + b + 1)) - (1 - p) * _entropy(a / (a + b + 1))
         return p + self.info_weight * information
 
+    # ---- activation and child selection --------------------------------------
+
+    def _activate(self, prefix, parent):
+        ancestors = []
+        ancestor = parent
+        while ancestor is not None:
+            ancestors.append(ancestor)
+            ancestor = self.nodes[ancestor]["parent"]
+        quota = max(0, self.base(prefix) - self.targets.prior_count(prefix, ancestors))
+        self.nodes[prefix] = {
+            "parent": parent,
+            "root": prefix if parent is None else self.nodes[parent]["root"],
+            "quota": quota,
+            "base_yes": 0,
+            "base_no": 0,
+            "adaptive_yes": 0,
+            "adaptive_no": 0,
+            "closed": False,
+            "heap_score": None,
+        }
+
     def _choose_child(self, prefix):
-        options = []
+        rec = self.nodes[prefix]
+        bgp_prefixes = self.frame.prefixes_by_root[rec["root"]]
+        best_child = None
+        best_score = float("-inf")
         for step in self.steps:
             length = prefix.prefixlen + step
             if length > 64:
                 continue
-            # Prefer the subspace with the deepest BGP evidence, then a
-            # response-blind random subspace when no more-specific exists.
-            root = self.active[prefix]["root"]
-            bgp_prefixes = getattr(self.frame, "prefixes_by_root", {}).get(root, self.frame.prefixes)
-            descendants = sorted((p for p in bgp_prefixes if p != prefix and p.subnet_of(prefix) and p.prefixlen >= length), key=lambda p: (p.prefixlen, self.frame.descendants[p]), reverse=True)
+            descendants = sorted(
+                (
+                    p
+                    for p in bgp_prefixes
+                    if p != prefix and p.subnet_of(prefix) and p.prefixlen >= length
+                ),
+                key=lambda p: (p.prefixlen, self.frame.descendants[p]),
+                reverse=True,
+            )
             child = None
-            evidence = 1
+            evidence = 1.0
             for ranked in descendants:
                 proposed = ranked.supernet(new_prefix=length) if ranked.prefixlen > length else ranked
-                if proposed not in self.active:
+                if proposed not in self.nodes:
                     child = proposed
                     evidence += self.bgp_weight * math.log1p(self.frame.descendants[ranked] + 1)
                     break
             if child is None:
                 children = list(prefix.subnets(new_prefix=length))
                 self.targets.rng.shuffle(children)
-                child = next((part for part in children if part not in self.active), None)
-            if child is not None and child not in self.active:
-                options.append((self._score(prefix) * evidence, child))
-        return max(options, default=(0, None), key=lambda item: item[0])
+                child = next((part for part in children if part not in self.nodes), None)
+            if child is not None:
+                score = self._score(prefix) * evidence
+                if score > best_score:
+                    best_score = score
+                    best_child = child
+        return best_child
 
-    def next_batch(self, limit):
-        if self.pending:
-            raise ValueError("feedback required before next batch")
-        batch = []
-        base_remaining = 0
-        if self.base_node is not None:
-            base_remaining = self.base(self.base_node) - self._counts(self.base_node)[2]
-            if base_remaining <= 0:
-                self.base_node = None
-        while len(batch) < limit:
-            if self.base_node is not None:
-                node = self.base_node
-            elif self.root_index < len(self.root_order) and len(self.observations) + len(batch) < self.allowance * self.root_fraction:
-                node = self.root_order[self.root_index]
-                self.root_index += 1
-                if self.base(node) > self.allowance - len(self.observations) - len(batch):
-                    continue
-                self.active[node] = {"parent": None, "root": node}
-                self.base_node = node
-                base_remaining = self.base(node)
-            else:
-                expandable = [p for p in self.active if p not in self.closed and p.prefixlen < 64]
-                if not expandable:
-                    break
-                parent = max(expandable, key=self._score)
-                child_score, child = self._choose_child(parent)
-                unsatisfied = max(0, self.base(child) - self._prior_count(child, self.active[parent]["root"], batch)) if child else 0
-                if child is not None and child_score > self._score(parent) and unsatisfied <= self.allowance - len(self.observations) - len(batch):
-                    self.active[child] = {"parent": parent, "root": self.active[parent]["root"]}
-                    node = child
-                    if unsatisfied:
-                        self.base_node = child
-                        base_remaining = unsatisfied
-                else:
-                    node = parent
-            c64 = self.targets.draw(node)
-            if c64 is None:
-                self.closed.add(node)
-                if self.base_node == node:
-                    self.base_node = None
+    # ---- frontier heap --------------------------------------------------------
+
+    def _heap_push(self, prefix):
+        score = self._score(prefix)
+        self.nodes[prefix]["heap_score"] = score
+        heapq.heappush(self.heap, (-score, self.seq, prefix))
+        self.seq += 1
+
+    def _heap_pop(self):
+        while self.heap:
+            _, _, prefix = heapq.heappop(self.heap)
+            rec = self.nodes.get(prefix)
+            if rec is None or rec["closed"]:
                 continue
-            batch.append({"c64": c64, "node": str(node), "stage": "search"})
-            if self.base_node == node:
-                base_remaining -= 1
-                if base_remaining <= 0:
-                    self.base_node = None
-        self.pending = batch
-        return batch
+            if prefix.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
+                continue
+            score = self._score(prefix)
+            if rec["heap_score"] is not None and abs(score - rec["heap_score"]) < 1e-12:
+                return prefix
+            rec["heap_score"] = score
+            heapq.heappush(self.heap, (-score, self.seq, prefix))
+            self.seq += 1
+        return None
 
-    def feedback(self, rows):
-        if len(rows) != len(self.pending):
-            raise ValueError("journal feedback size mismatch")
-        for item, row in zip(self.pending, rows):
-            yes = int(row["is_observed_positive"])
-            self.observations[item["c64"]] = yes
-            node = ipaddress.ip_network(item["node"])
-            self.records_by_root[self.active[node]["root"]][item["c64"]] = yes
-        self.pending = []
+    # ---- planning and streaming ----------------------------------------------
+
+    def _plan(self, limit):
+        plan = []
+        remaining = limit
+        planned = self.sent
+        while remaining > 0 and self.root_index < len(self.root_order) and planned < self.root_phase_budget:
+            root = self.root_order[self.root_index]
+            self.root_index += 1
+            quota = self.base(root)
+            if quota > self.allowance - planned:
+                continue  # this root's full base no longer fits; skip it for good
+            self._activate(root, None)
+            count = min(remaining, quota)
+            plan.append((root, count, "base"))
+            self._touched.add(root)
+            planned += count
+            remaining -= count
+        while remaining > 0:
+            node = self._heap_pop()
+            if node is None:
+                break
+            rec = self.nodes[node]
+            sent = self._node_sent(rec)
+            if sent < rec["quota"]:
+                count = min(remaining, rec["quota"] - sent)
+                mode = "base"
+            else:
+                child = self._choose_child(node)
+                if child is not None:
+                    self._activate(child, node)
+                    node = child
+                    unsatisfied = self.nodes[node]["quota"]
+                    mode = "base" if unsatisfied else "dynamic"
+                else:
+                    unsatisfied = 0
+                    mode = "dynamic"
+                count = min(remaining, unsatisfied or self.action_block)
+            plan.append((node, count, mode))
+            self._touched.add(node)
+            remaining -= count
+        return plan
+
+    def iter_targets(self, limit):
+        for node, count, mode in self._plan(limit):
+            ancestors = []
+            parent = self.nodes[node]["parent"]
+            while parent is not None:
+                ancestors.append(parent)
+                parent = self.nodes[parent]["parent"]
+            for _ in range(count):
+                c64 = self.targets.draw(node, ancestors)
+                if c64 is None:
+                    self.nodes[node]["closed"] = True
+                    break
+                yield (c64, str(node), mode)
+
+    # ---- feedback and persistence --------------------------------------------
+
+    @staticmethod
+    def _node_sent(rec):
+        return rec["base_yes"] + rec["base_no"] + rec["adaptive_yes"] + rec["adaptive_no"]
+
+    def feed_aggregate(self, node_str, mode, probes, positives, replies, sources):
+        node = ipaddress.ip_network(node_str)
+        stem = "base" if mode == "base" else "adaptive"
+        self.nodes[node][f"{stem}_yes"] += positives
+        self.nodes[node][f"{stem}_no"] += probes - positives
+        self.sent += probes
+        self.positive_count += positives
+
+    def finish_batch(self):
+        for node in self._touched:
+            rec = self.nodes[node]
+            if rec["closed"]:
+                continue
+            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
+                continue
+            self._heap_push(node)
+        self._touched.clear()
+        self.epoch += 1
+
+    def snapshot(self):
+        return {
+            "nodes": {
+                str(p): {
+                    "parent": str(rec["parent"]) if rec["parent"] else None,
+                    "quota": rec["quota"],
+                    "root": str(rec["root"]),
+                    "base_yes": rec["base_yes"],
+                    "base_no": rec["base_no"],
+                    "adaptive_yes": rec["adaptive_yes"],
+                    "adaptive_no": rec["adaptive_no"],
+                    "closed": rec["closed"],
+                }
+                for p, rec in self.nodes.items()
+            },
+            "sent": self.sent,
+            "positive_count": self.positive_count,
+            "root_index": self.root_index,
+            "epoch": self.epoch,
+        }
+
+    def restore(self, state):
+        self.nodes = {
+            ipaddress.ip_network(p): {
+                "parent": ipaddress.ip_network(rec["parent"]) if rec["parent"] else None,
+                "root": ipaddress.ip_network(rec["root"]),
+                "quota": rec["quota"],
+                "base_yes": rec["base_yes"],
+                "base_no": rec["base_no"],
+                "adaptive_yes": rec["adaptive_yes"],
+                "adaptive_no": rec["adaptive_no"],
+                "closed": rec["closed"],
+                "heap_score": None,
+            }
+            for p, rec in state["nodes"].items()
+        }
+        self.sent = state["sent"]
+        self.positive_count = state["positive_count"]
+        self.root_index = state["root_index"]
+        self.epoch = state["epoch"]
+        self.cache = {}
+        self.heap = []
+        self.seq = 0
+        for node, rec in self.nodes.items():
+            if rec["closed"]:
+                continue
+            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
+                continue
+            self._heap_push(node)

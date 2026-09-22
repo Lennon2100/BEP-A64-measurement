@@ -10,6 +10,19 @@
 - 两种方法各自从零探针成本开始，预算上限各为 5B。只在本方法内部对已探测 `/64` 去重。不读取历史目标清单、历史响应或历史成本；不做校准或留出集测量。
 - 当前正式配置只启用 journal 和 SubRecon。TNet 暂缓；后续加入 `strategies/tnet.py` 与配置项即可接入。两种方法的预算是上限，候选耗尽时可能提前结束。
 
+## 理论规则与工程批次
+
+- 决策单位是**动作块** `(节点, 探针数)`，不是单探针。一个反馈轮次内，调度器只做一次前沿评分，产出一个动作块计划，然后流式生成目标；批内没有新反馈，不重复评分。
+- **反馈批次 = ZMap 文件批次**。ZMap 一次进程接受一份固定目标列表、发完后再收一个 `--cooldown-time`（接收尾窗），不支持扫描中途注入新目标，所以一个 ZMap 进程就是一轮反馈。策略的“动作粒度”（`action_block`）与“反馈粒度”（`batch_size`）是两回事：前者决定目标在批内的空间投放，后者决定多久更新一次后验。
+- 每个探针在**恰好一个节点内均匀抽取**。节点分别保存基础样本与自适应样本的阳性/非阳性聚合；两类目标都在被选节点内均匀，所以都可进入该节点的 Beta 似然，但不向祖先重复加入似然。子节点用祖先确定性置换游标排除已测 `/64`；父节点激活后代后不再发新目标，因此无需保存全程 `/64` 集合也能精确去重。
+- 前沿是不同真实前缀长度节点的同一轮调度（混合深度），容量、HD 基础配额、先验衰减都按真实 `len(v)` 计算。
+
+## 时间与空间复杂度
+
+- 每反馈轮次：决策 O(动作数 × 树深)（后验按 epoch 记忆化，一次评分只沿祖先链最多 64 跳）+ 目标流式生成 O(批大小)。
+- 常驻内存：策略侧 O(活跃节点)，包括节点聚合、前沿堆与确定性置换游标；解析侧 O(单批响应数 + 单批动作数)，不随历史累计探针数增长。
+- **仍随总探针数增长的内容**只有必须保留的逐批磁盘证据归档。恢复状态、节点聚合和游标是 O(活跃节点)，不再保存 Python 全程去重集合或 `probed-*.bin`。
+
 ## 输入与配置
 
 配置模板是 `formal.example.json`。将其复制成 `formal.json`，按 Linux 主机实际情况设置网络参数与新的 `output_root`。配置相对路径从 `formal.json` 所在目录解析。不要沿用包含旧规则归档的输出目录；续跑必须使用与本次运行内容相同的配置。
@@ -20,18 +33,21 @@
 | `input.subrecon_prefix_csv` | `data/interim/ris_ipv6_top_level_prefixes.csv` |
 | `input.frame_exclusions` | `config/frame_exclusions.txt`，排除 `2002::/16` |
 | `budget_total_per_method` | `5000000000`，每方法独立上限 |
-| `batch_size` | `8192` |
+| `batch_size` | `1000000`，一个反馈轮次/ZMap 进程的探针数 |
+| `strategies.journal.action_block` | `8192`，每个动态动作块的探针数 |
 | `slow_au_threshold_ms` | `1000` |
 | `scanner.zmap_binary` | `.build/zmap-build/src/zmap` |
 | `scanner.source_ipv6` | 模板为 `2607:8700:5500:3959::2`，运行前按主机实际值确认 |
 | `scanner.interface` | 模板为 `ipv6net` |
 | `scanner.gateway_mac` | 模板为 `-`，SIT/NOARP 接口使用 ZMap `--iplayer` |
 | `scanner.rate_pps` | 模板为 `1000`，运行前按实际允许速率确认 |
-| `scanner.cooldown_seconds` | `30` |
+| `scanner.cooldown_seconds` | `30`，ZMap 接收尾窗，需覆盖慢 AU 的 RTT（观测最大约 25 s） |
 | `strategies.journal.theta_b` | `1`；其余搜索系数见模板 |
 | `output_root` | `runs/formal-journal-subrecon-5b-v1`，首次运行应为空 |
 
-正式运行不读取 scan 排除表，也不要求 RIS 快照身份。Linux 主机需有上述两份 RIS CSV、frame 排除文件和已构建的 ZMap。扫描包装脚本向 ZMap 传入 `-i`、`--ipv6-source-ip`，并为此 fork 的 IPv4 初始化传入 `-S 0.0.0.0`；实际 IPv6 探针使用配置中的源 IPv6。ZMap 构建及扫描包装参数见 [README.md](README.md)。模板中的 1000 pps、8192 探针一批、每批 30 秒冷却意味着每方法 5B 探针仅发送与冷却的理论时间约 270 天；还未计计算、解析和停机时间。
+**可行性**：1000 pps 下每探针 1 ms，5B 探针纯发送约 57.9 天，与批次和冷却无关；30 s 冷却只是每轮固定的接收尾窗。1000 pps、100 万探针/批、30 s 尾窗时，每方法 5B 的理论纯发送与尾窗约 58 天，仍未计计算、解析和停机。5B 是配置上限而非已证可执行规模；首个实网运行应缩小到“天级”预算，并只在授权后提高 `rate_pps`。
+
+正式运行不读取 scan 排除表，也不要求 RIS 快照身份。Linux 主机需有上述两份 RIS CSV、frame 排除文件和已构建的 ZMap。扫描包装脚本向 ZMap 传入 `-i`、`--ipv6-source-ip`，并为此 fork 的 IPv4 初始化传入 `-S 0.0.0.0`；实际 IPv6 探针使用配置中的源 IPv6。ZMap 构建及扫描包装参数见 [README.md](README.md)。
 
 ## 启动、暂停、续跑
 
@@ -55,12 +71,30 @@ sudo python3 scripts/run_formal.py formal.json journal --resume
 sudo python3 scripts/run_formal.py formal.json subrecon --resume
 ```
 
-每个完成批次保存为 `batch-000000001.tar.gz` 等压缩包，包含目标清单、实际命令、扫描器版本、原始 ZMap CSV、逐探针解析 CSV、末跳源地址证据、该批 `ledger.csv` 和日志。压缩包写完并读回后，runner 删除对应 `.work/`；压缩期间磁盘要同时容纳该批原文件和压缩包。若进程在批次中途被强制终止，遗留的 `.work/` 或 `.tar.gz.part` 会阻止自动续跑，因为该批可能已有探针发出；必须先人工核对实际发包情况。
+续跑直接读取最新完成归档内的 `state.json`（紧凑节点聚合、前沿状态与置换游标），**不重放历史逐探针记录**；启动成本和常驻策略状态均为 O(活跃节点)。批后 `state.json` 先写入批目录、再随批归档，归档是唯一原子提交点；归档完成前中断会遗留 `.work` 或 `.tar.gz.part`，阻止自动续跑。
 
-续跑从已归档批次的真实解析结果重建策略状态，不重发这些批次。重建时间和内存占用随已完成探针数增长；目前尚未证明 5B 规模能在目标主机上完成。
+每个完成批次保存为 `batch-000000001.tar.gz` 等压缩包，内含唯一且保持发送顺序的 `manifest.csv`、实际命令、扫描器版本、原始 ZMap CSV、紧凑逐探针证据、节点级反馈、末跳源地址证据、批后 `state.json` 和日志。临时 `sent-targets.txt` 与 manifest 的 `target_ipv6` 列重复，扫描结束后即删除。压缩包写完并读回后，runner 删除对应 `.work/`；压缩期间磁盘要同时容纳该批原文件和压缩包。若进程在批次中途被强制终止，遗留的 `.work/` 或 `.tar.gz.part` 会阻止自动续跑，因为该批可能已有探针发出；必须先人工核对实际发包情况。
 
 ## 输出与比较
 
-每方法完成后写 `summary.json`、`last-hop-routers.txt.gz` 和按需生成的 `native-prefixes.txt.gz`。末跳列表记录去重后的候选接口地址，不是经过独立核验的路由器设备数。分析器读取各批压缩台账，在输出根目录写 `comparison.csv` 与 `cost-discovery-curve.csv.gz`。成本列 `probe_cost` 及 `formal_sent` 统计本次成功完成扫描批次中的目标，不包含任何历史探针。
+每方法完成后写 `summary.json`、`last-hop-routers.txt.gz` 和按需生成的 `native-prefixes.txt.gz`。末跳列表记录去重后的候选接口地址，不是经过独立核验的路由器设备数。分析器从各批 `probes.csv` 派生 `comparison.csv` 与 `cost-discovery-curve.csv.gz`，不再存逐探针台账文件。`formal_sent` 与 `distinct_new_positive_c64` 统计本次成功完成扫描批次中的目标（每个 `/64` 最多一发，故阳性探针数即不同阳性 `/64` 数），不包含任何历史探针。
+
+## 磁盘增长估算（每批 B 个探针、全程 T 个探针）
+
+- 工作目录单批仍由 `manifest.csv`、`probes.csv` 与原始 ZMap CSV 主导；按当前短字段预计未压缩约 0.3–0.6 KB/探针，压缩比必须以首个真实批次实测，不能把估算当容量保证。
+- 全程磁盘是 O(T) 的原始证据归档；`state.json` 为 O(活跃节点)。若压缩后为 0.05–0.15 KB/探针，T=10^8 约 5–15 GB，T=5×10^9 约 250–750 GB；正式 5B 前必须按真实首批压缩率确认外置存储和迁出流程。
+
+## 旧运行目录的安全处理
+
+若某方法输出目录只有 `formal.json`（没有任何 `batch-*` 归档），且已由进程状态和日志确认 ZMap 未启动，则可安全删除或改名后重跑。处理前先确认：
+
+```bash
+cd /root/BEP-A64-measurement
+ls -la runs/formal-journal-subrecon-5b-v1/journal
+# 仅出现 formal.json（可能还有空目录）才继续
+rm -rf runs/formal-journal-subrecon-5b-v1/journal
+```
+
+只要出现了任何 `batch-*.work`、`batch-*.tar.gz` 或 `batch-*.tar.gz.part`，就说明已有（或可能已有）发包，必须人工核对实际发送情况，不要盲删。用户报告的旧 journal 目录只有 `formal.json` 且 ZMap 未启动；确认现状仍一致后删除该目录，再用新代码和新配置启动。
 
 当前代码与文档只说明运行方式；本轮没有启动公网扫描，也没有运行模拟反馈。

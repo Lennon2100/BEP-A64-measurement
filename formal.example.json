@@ -7,7 +7,7 @@
   },
   "seed": "bep-full-tree-formal-v1",
   "budget_total_per_method": 5000000000,
-  "batch_size": 8192,
+  "batch_size": 1000000,
   "slow_au_threshold_ms": 1000,
   "scanner": {
     "zmap_binary": ".build/zmap-build/src/zmap",
@@ -21,6 +21,7 @@
     "journal": {
       "theta_b": 1,
       "step_bits": [1, 4, 8],
+      "action_block": 8192,
       "prior_strength": 2,
       "prior_decay": 0.85,
       "information_weight": 0.25,
