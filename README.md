@@ -11,10 +11,14 @@ The current boundary is intentionally small:
 strategy implementation -> ordered target file -> run_scan.sh -> raw ZMap CSV
 ```
 
-Each search or baseline strategy remains a separate target producer. The scanner
-does not know whether a target came from BEP, PaS, SubRecon, random sampling, or
-the journal policy. This file boundary is the strategy plug-in point; no generic
-plug-in framework is built before two real strategies require shared code.
+Each search strategy or adapted comparator remains a separate target producer.
+The scanner need not know whether a target came from the journal policy,
+paper-based TNet reproduction, or BGP-only ICNP SubRecon strategy adaptation.
+The three methods will share the same BGP-prefix input, not activity-bearing
+target lists; offline prefix-tree construction spends no scan probes. The
+SubRecon adaptation must not import an external Hitlist or active-address
+seed. `scripts/run_formal.py` runs one adaptive method through this boundary;
+`campaign.json` remains the completed fixed-panel D050 configuration.
 
 ## Included now
 
@@ -37,9 +41,46 @@ plug-in framework is built before two real strategies require shared code.
 - `scripts/parse_results.py`: joins one raw ZMap round to the target manifest,
   computes RTT, derives the operational response class, and adds timeout rows.
 - `strategies/README.md`: the minimal target-producer contract.
+- `strategies/journal.py`, `strategies/tnet.py`, and
+  `strategies/subrecon.py`: the three independent formal search policies.
+- `scripts/run_formal.py`: the formal scan, parse, and cost-ledger loop.
 
-Reference-label aggregation and policy evaluation are not implemented yet.
-They consume the saved target plan and raw measurement data later.
+`scripts/analyze_campaign.py` already aggregates the D050 reference labels and
+calibration results. The formal runner writes per-method cumulative cost and
+discovery ledgers; it does not combine them into a paper figure.
+
+## Formal three-method run
+
+Copy `formal.example.json` to a new configuration on the Linux measurement
+host. Replace its proposed budget and coefficients with frozen choices, fill
+`input.ris_snapshots` with exact collector RIB identities, and point
+`input.bgp_tree_csv` and `input.prior_c64_manifest` at the server's prepared
+tree and D050 effective manifest. Check the source address, interface, scan
+exclusions, finite packet rate, and output directory. The example has an empty
+`ris_snapshots` list, so `run_formal.py` rejects it before sending probes.
+
+```bash
+python3 scripts/run_formal.py formal.json journal
+python3 scripts/run_formal.py formal.json tnet
+python3 scripts/run_formal.py formal.json subrecon
+```
+
+Each invocation refuses to overwrite its method directory. Every batch keeps
+the target manifest, ordered sent list, scanner command and version, raw ZMap
+CSV, parsed per-probe CSV, and strategy metadata. `ledger.csv` records charged
+stages, cumulative formal probes, attributed total probes, and distinct newly
+observed IMC-positive `/64`s. The journal total includes the 149,652 D050
+historical probes; D050 positives are not counted as fresh formal discoveries.
+All methods exclude the same D050 search `/64`s from new selection without
+using their old responses as search labels.
+
+The TNet adaptation uses a budgeted `/48` screen and `/48` plus `/52` feedback
+allocation. It is a paper-based reimplementation because TNet source is not
+available here. The conference SubRecon adaptation starts from BGP prefixes,
+uses `thuname/subrecon`'s `src/budget.c` probe table, and refines using AU
+source diversity and response coverage. Its external Hitlist expansion phase
+is omitted. Native comparator regions or prefixes stay in
+`native-prefixes.txt` separately from the common positive `/64` count.
 
 ## Linux build
 
@@ -132,17 +173,17 @@ The command refuses to overwrite its three outputs:
 - `summary.json` records structural counts, excluded rows, total routed C64
   mass, root-length counts/C64 mass, and the root maximum-tree-depth histogram.
 
-The default preparation stage does not subdivide a short root or assign tranches. After
-inspecting the full root-feature distribution, define a small set of
-response-blind root strata and assign whole roots within strata to calibration
-or held-out using a recorded seed. This preserves the top-level search start
-and prevents response state from crossing the evaluation split. Calibration
-C64 and IID targets are emitted only when the root split and a separate target
-seed are both supplied.
+The default preparation stage does not subdivide a short root or assign
+tranches. For the already completed D050 calibration, a response-blind root
+assignment selected the sampled roots before probing. That assignment remains
+only provenance of the D050 target plan; the final comparison uses the entire
+eligible routed tree and has no root-based evaluation split. The D050
+calibration C64/IID targets are emitted only when the historical root-assignment
+seed and a separate target seed are both supplied.
 
-For the current frame, the recorded root-depth strata are `d0`, `d1`, `d2`,
-and `d3plus`. Re-run into a new output directory to assign exactly one fifth of
-the roots in each stratum to calibration by deterministic hash rank:
+For the D050 plan, the recorded root-depth strata are `d0`, `d1`, `d2`, and
+`d3plus`. Re-running into a new output directory reproduces the historical
+one-fifth root assignment by deterministic hash rank:
 
 ```bash
 python3 scripts/prepare_campaign.py \
@@ -153,9 +194,10 @@ python3 scripts/prepare_campaign.py \
   --calibration-root-fraction 1/5
 ```
 
-Every prefix under one root receives the same tranche. The summary reports root
-counts and C64 combinatorial mass for both sides and for each depth stratum.
-C64 mass is diagnostic only and does not control the split or probe budget.
+Every prefix under one root receives the same historical tranche label. The
+summary reports root counts and C64 combinatorial mass for both sides and for
+each depth stratum. C64 mass is diagnostic only and does not control the formal
+probe budget.
 
 `config/frame_exclusions.txt` currently excludes `2002::/16`. It is IANA
 special-purpose 6to4 transition space: native IPv6 routing sends the aggregate
@@ -206,6 +248,6 @@ It derives `direct`, `slow_au`, `fast_au`, `nr`, `ap`, `rr`, `tx`,
 `other_error`, `timeout`, or `unmatched`; only direct Echo Reply and Type 1
 Code 3 at RTT greater than or equal to 1000 ms set
 `is_observed_positive=1`. A JSON summary is written beside the parsed CSV.
-Multiple raw responses for the same planned target stop parsing because the
-one-row-per-probe selection rule would otherwise be ambiguous; the raw CSV is
-left unchanged for inspection.
+Multiple validated responses of the same class for one planned target are
+collapsed to the first arrival and their multiplicity is recorded. Different
+response classes for one target stop parsing; the raw CSV is left unchanged.

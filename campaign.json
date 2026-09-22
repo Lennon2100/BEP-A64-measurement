@@ -33,11 +33,7 @@
     "threshold_sensitivity_ms": [800, 1000, 1200]
   },
   "safety": {
-    "scan_exclusions": "config/scan_exclusions.txt",
-    "contact": "",
-    "measurement_page": "",
-    "opt_out": "",
-    "stop_procedure": ""
+    "scan_exclusions": "config/scan_exclusions.txt"
   },
   "output_root": "runs/calibration-native-v1"
 }

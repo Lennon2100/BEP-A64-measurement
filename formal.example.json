@@ -1,0 +1,42 @@
+{
+  "campaign_id": "formal-full-tree-proposed-v1",
+  "input": {
+    "bgp_tree_csv": "runs/frame-preparation/bgp_tree.csv",
+    "prior_c64_manifest": "runs/calibration-native-v1/effective_calibration_targets.csv",
+    "scan_exclusions": "config/scan_exclusions.txt",
+    "ris_snapshots": []
+  },
+  "seed": "bep-full-tree-formal-v1",
+  "budget_total_per_method": 1000000,
+  "journal_historical_probes": 149652,
+  "batch_size": 8192,
+  "slow_au_threshold_ms": 1000,
+  "scanner": {
+    "zmap_binary": ".build/zmap-build/src/zmap",
+    "source_ipv6": "2607:8700:5500:3959::2",
+    "interface": "ipv6net",
+    "gateway_mac": "-",
+    "probes": 1,
+    "rate_pps": 1000,
+    "cooldown_seconds": 30
+  },
+  "strategies": {
+    "journal": {
+      "theta_b": 1,
+      "step_bits": [1, 4, 8],
+      "prior_strength": 2,
+      "prior_decay": 0.85,
+      "information_weight": 0.25,
+      "bgp_weight": 0.25,
+      "root_budget_fraction": 0.5
+    },
+    "tnet": {
+      "screen_budget": 200000,
+      "rounds": 10,
+      "top_k": 10000,
+      "temperature": 1
+    },
+    "subrecon": {}
+  },
+  "output_root": "runs/formal-full-tree-v1"
+}
