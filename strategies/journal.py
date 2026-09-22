@@ -219,14 +219,15 @@ class Strategy:
                 mode = "base"
             else:
                 child = self._choose_child(node)
-                if child is not None:
-                    self._activate(child, node)
-                    node = child
-                    unsatisfied = self.nodes[node]["quota"]
-                    mode = "base" if unsatisfied else "dynamic"
-                else:
-                    unsatisfied = 0
-                    mode = "dynamic"
+                if child is None:
+                    # All step-children are active, so this node's /64s are
+                    # covered by them; drawing here would re-probe descendants.
+                    self.nodes[node]["closed"] = True
+                    continue
+                self._activate(child, node)
+                unsatisfied = self.nodes[child]["quota"]
+                mode = "base" if unsatisfied else "dynamic"
+                node = child
                 count = min(remaining, unsatisfied or self.action_block)
             plan.append((node, count, mode))
             self._touched.add(node)
