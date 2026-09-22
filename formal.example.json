@@ -3,12 +3,10 @@
   "input": {
     "journal_prefix_csv": "data/interim/ris_ipv6_prefixes_unique.csv",
     "subrecon_prefix_csv": "data/interim/ris_ipv6_top_level_prefixes.csv",
-    "frame_exclusions": "config/frame_exclusions.txt",
-    "prior_c64_manifest": "runs/calibration-native-v1/effective_calibration_targets.csv"
+    "frame_exclusions": "config/frame_exclusions.txt"
   },
   "seed": "bep-full-tree-formal-v1",
   "budget_total_per_method": 5000000000,
-  "historical_probes": {"journal": 149652},
   "batch_size": 8192,
   "slow_au_threshold_ms": 1000,
   "scanner": {

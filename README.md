@@ -14,7 +14,7 @@ strategy implementation -> ordered target file -> run_scan.sh -> raw ZMap CSV
 Each search strategy or adapted comparator remains a separate target producer.
 The scanner need not know which method produced a target. The journal strategy
 reads the full unique RIS prefix CSV; the BGP-only ICNP SubRecon adaptation
-reads the separate top-level-prefix CSV. Neither receives D050 response labels
+reads the separate top-level-prefix CSV. Neither receives historical response labels
 or an external Hitlist. `scripts/run_formal.py` runs one method through this boundary;
 `campaign.json` remains the completed fixed-panel D050 configuration.
 
@@ -60,9 +60,9 @@ response-blind arithmetic. Confirm the
 source address, interface, finite packet rate, and output directory before
 sending probes. The input paths in the example match
 `MEASUREMENT_RUNBOOK.md`: the journal method loads
-`data/interim/ris_ipv6_prefixes_unique.csv`, SubRecon loads
-`data/interim/ris_ipv6_top_level_prefixes.csv`, and the prior `/64` manifest
-records the shared policy of excluding D050 search targets from fresh probing.
+`data/interim/ris_ipv6_prefixes_unique.csv`, and SubRecon loads
+`data/interim/ris_ipv6_top_level_prefixes.csv`. Both start with zero formal
+probe cost and deduplicate targets within their own run.
 
 ```bash
 sudo python3 scripts/run_formal.py formal.json journal
@@ -95,12 +95,9 @@ Each method writes `last-hop-routers.txt.gz` with distinct observed AU source IP
 addresses; `summary.json` and `comparison.csv` report that count. These are
 candidate last-hop interface addresses, not verified router identities, and
 they do not change the discovery metric or seed a strategy. Each archived
-ledger records charged stages, cumulative formal probes, attributed total
-probes, and distinct newly
-observed IMC-positive `/64`s. The journal total includes the 149,652 D050
-historical probes; D050 positives are not counted as fresh formal discoveries.
-All methods exclude the same D050 search `/64`s from new selection without
-using their old responses as search labels.
+ledger records charged stages, cumulative targets in completed scan batches,
+and distinct newly observed IMC-positive `/64`s. Historical probes and target lists are not
+loaded into a formal method.
 
 The conference SubRecon adaptation starts from the top-level BGP prefixes,
 uses `thuname/subrecon`'s `src/budget.c` probe table, and refines using AU

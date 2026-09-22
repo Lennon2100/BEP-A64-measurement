@@ -20,12 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from strategies.common import Targets, read_prior_c64s
+from strategies.common import Targets
 from parse_results import PLAN_FIELDS
 
 
 STOP_REQUESTED = False
-LEDGER_FIELDS = ("probe_number", "attributed_total", "stage", "probe_id", "c64", "response_class", "positive", "distinct_positive", "batch")
+LEDGER_FIELDS = ("probe_number", "stage", "probe_id", "c64", "response_class", "positive", "distinct_positive", "batch")
 ARCHIVE_FILES = (
     "targets.csv", "target-metadata.csv", "sent-targets.txt", "raw-zmap.csv",
     "raw-zmap.csv.command.txt", "raw-zmap.csv.scanner-version.txt", "scan.log",
@@ -39,12 +39,11 @@ def absolute(base, value):
     return path if path.is_absolute() else base / path
 
 
-def allowance_for(cfg, method):
+def allowance_for(cfg):
     total = int(cfg["budget_total_per_method"])
-    historical = int(cfg["historical_probes"].get(method, 0))
-    if not 0 < total <= 100_000_000_000 or total <= historical:
-        raise ValueError("formal method budget must exceed historical cost and stay within 100B")
-    return total - historical
+    if not 0 < total <= 100_000_000_000:
+        raise ValueError("formal method budget must be positive and stay within 100B")
+    return total
 
 
 def write_csv(path, fields, rows):
@@ -92,7 +91,7 @@ def archive_batch(folder, archive):
     shutil.rmtree(folder)
 
 
-def account_batch(batch, metadata, rows, sent_count, historical, observed, stages, round_name):
+def account_batch(batch, metadata, rows, sent_count, observed, stages, round_name):
     ledger_rows = []
     for target, meta, row in zip(batch, metadata, rows):
         sent_count += 1
@@ -100,7 +99,7 @@ def account_batch(batch, metadata, rows, sent_count, historical, observed, stage
         if positive:
             observed.add(target["c64"])
         stages[target["stage"]] += 1
-        ledger_rows.append({"probe_number": sent_count, "attributed_total": sent_count + historical,
+        ledger_rows.append({"probe_number": sent_count,
                             "stage": target["stage"], "probe_id": meta["probe_id"],
                             "c64": meta["c64"], "response_class": row["response_class"],
                             "positive": int(positive), "distinct_positive": len(observed), "batch": round_name})
@@ -113,8 +112,7 @@ def run_method(config_path, method, resume=False):
         cfg = json.load(fh)
     if method not in cfg["strategies"]:
         raise ValueError(f"method {method} is absent from formal configuration")
-    allowance = allowance_for(cfg, method)
-    historical = int(cfg["historical_probes"].get(method, 0))
+    allowance = allowance_for(cfg)
     output = absolute(base, cfg["output_root"]) / method
     if resume:
         if not output.is_dir():
@@ -131,8 +129,7 @@ def run_method(config_path, method, resume=False):
 
     strategy_module = importlib.import_module(f"strategies.{method}")
     frame = strategy_module.load_frame(cfg, base)
-    prior = read_prior_c64s(absolute(base, cfg["input"]["prior_c64_manifest"]))
-    targets = Targets(f"{cfg['seed']}:{method}", prior)
+    targets = Targets(f"{cfg['seed']}:{method}")
     strategy = strategy_module.Strategy(frame, targets, cfg["strategies"][method], allowance)
     if not resume:
         output.mkdir(parents=True)
@@ -169,7 +166,7 @@ def run_method(config_path, method, resume=False):
             parsed_by_probe = {row["probe_id"]: row for row in tables["probes.csv"] if row["probe_id"]}
             rows = [parsed_by_probe[meta["probe_id"]] for meta in metadata]
             strategy.feedback(rows)
-            sent_count, _ = account_batch(batch, metadata, rows, sent_count, historical, observed, stage_counts, round_name)
+            sent_count, _ = account_batch(batch, metadata, rows, sent_count, observed, stage_counts, round_name)
             last_hop_routers.update(row["router_ipv6"] for row in tables["last-hop-router-observations.csv"])
             batch_number = number
             work_folder = output / f"{round_name}.work"
@@ -220,18 +217,18 @@ def run_method(config_path, method, resume=False):
             parsed_by_probe = {row["probe_id"]: row for row in csv.DictReader(fh) if row["probe_id"]}
         rows = [parsed_by_probe[entry["probe_id"]] for entry in metadata]
         strategy.feedback(rows)
-        sent_count, ledger_batch = account_batch(batch, metadata, rows, sent_count, historical, observed, stage_counts, round_name)
+        sent_count, ledger_batch = account_batch(batch, metadata, rows, sent_count, observed, stage_counts, round_name)
         write_csv(folder / "ledger.csv", LEDGER_FIELDS, ledger_batch)
         archive_batch(folder, archive)
     if STOP_REQUESTED:
-        return {"status": "paused", "method": method, "completed_batches": batch_number, "formal_sent": sent_count, "attributed_total": sent_count + historical}
+        return {"status": "paused", "method": method, "completed_batches": batch_number, "formal_sent": sent_count}
     native = getattr(strategy, "native_prefixes", getattr(strategy, "regions", []))
     if native:
         with gzip.open(output / "native-prefixes.txt.gz", "wt", encoding="utf-8") as fh:
             fh.writelines(str(prefix) + "\n" for prefix in native)
     with gzip.open(output / "last-hop-routers.txt.gz", "wt", encoding="utf-8") as fh:
         fh.writelines(router + "\n" for router in sorted(last_hop_routers, key=ipaddress.IPv6Address))
-    summary = {"method": method, "started_from": "RIS BGP only", "finished_utc": datetime.now(timezone.utc).isoformat(), "budget_total": int(cfg["budget_total_per_method"]), "historical_attributed": historical, "formal_sent": sent_count, "attributed_total": sent_count + historical, "budget_exhausted": sent_count == allowance, "distinct_new_positive_c64": len(observed), "distinct_last_hop_router_addresses": len(last_hop_routers), "stages": dict(stage_counts), "native_prefix_count": len(native)}
+    summary = {"method": method, "started_from": "RIS BGP only", "finished_utc": datetime.now(timezone.utc).isoformat(), "budget_total": allowance, "formal_sent": sent_count, "budget_exhausted": sent_count == allowance, "distinct_new_positive_c64": len(observed), "distinct_last_hop_router_addresses": len(last_hop_routers), "stages": dict(stage_counts), "native_prefix_count": len(native)}
     summary_part = output / "summary.json.part"
     summary_part.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     os.replace(summary_part, output / "summary.json")

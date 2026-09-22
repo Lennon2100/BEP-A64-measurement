@@ -16,10 +16,6 @@ def network(text):
     return value
 
 
-def c64_of(address):
-    return ipaddress.ip_network((int(ipaddress.ip_address(address)), 64), strict=False)
-
-
 class Frame:
     def __init__(self, prefixes, parents):
         self.prefixes = sorted(prefixes, key=lambda p: (int(p.network_address), p.prefixlen))
@@ -52,9 +48,9 @@ class Frame:
 
 
 class Targets:
-    def __init__(self, seed, prior_c64s=()):
+    def __init__(self, seed):
         self.rng = random.Random(seed)
-        self.used = set(prior_c64s)
+        self.used = set()
         self.positions = {}
 
     def draw(self, prefix):
@@ -76,8 +72,3 @@ class Targets:
     def address(self, c64):
         iid = self.rng.randrange(1, 1 << 64)
         return str(ipaddress.IPv6Address((c64 << 64) | iid))
-
-
-def read_prior_c64s(path):
-    with open(path, newline="", encoding="utf-8") as fh:
-        return {int(c64_of(row["c64"]).network_address) >> 64 for row in csv.DictReader(fh) if row["round"] == "search"}

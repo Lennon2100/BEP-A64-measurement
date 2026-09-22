@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Combine completed strategy ledgers without counting historical probes as new finds."""
+"""Combine completed strategy ledgers into cost and discovery tables."""
 
 import argparse
 import csv
@@ -21,20 +21,19 @@ def ledger_rows(method_dir):
 
 
 def cost_curve(method_dir, summary, interval):
-    history = summary["historical_attributed"]
     sent = summary["formal_sent"]
     budget = summary["budget_total"]
-    checkpoints = (cost for cost, _ in groupby(merge(range(0, budget + 1, interval), sorted((history, history + sent)))))
+    checkpoints = (cost for cost, _ in groupby(merge(range(0, budget + 1, interval), (sent,))))
     iterator = iter(ledger_rows(method_dir))
     upcoming = next(iterator, None)
     positives = 0
     for ceiling in checkpoints:
-        if ceiling > history + sent:
+        if ceiling > sent:
             break
-        while upcoming is not None and int(upcoming["attributed_total"]) <= ceiling:
+        while upcoming is not None and int(upcoming["probe_number"]) <= ceiling:
             positives = int(upcoming["distinct_positive"])
             upcoming = next(iterator, None)
-        yield {"method": summary["method"], "attributed_probe_cost": ceiling, "distinct_new_positive_c64": positives}
+        yield {"method": summary["method"], "probe_cost": ceiling, "distinct_new_positive_c64": positives}
 
 
 def main():
@@ -60,13 +59,13 @@ def main():
     if comparison_path.exists() or curve_path.exists():
         raise FileExistsError("refusing to overwrite formal comparison")
     with comparison_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=("method", "budget_total", "historical_attributed", "formal_sent", "attributed_total", "budget_exhausted", "distinct_new_positive_c64", "distinct_last_hop_router_addresses", "probes_per_new_discovery", "stages"))
+        writer = csv.DictWriter(fh, fieldnames=("method", "budget_total", "formal_sent", "budget_exhausted", "distinct_new_positive_c64", "distinct_last_hop_router_addresses", "probes_per_new_discovery", "stages"))
         writer.writeheader()
         for summary in summaries:
             discoveries = summary["distinct_new_positive_c64"]
-            writer.writerow({**{key: summary[key] for key in ("method", "budget_total", "historical_attributed", "formal_sent", "attributed_total", "budget_exhausted", "distinct_new_positive_c64", "distinct_last_hop_router_addresses")}, "probes_per_new_discovery": summary["attributed_total"] / discoveries if discoveries else "", "stages": json.dumps(summary["stages"], sort_keys=True)})
+            writer.writerow({**{key: summary[key] for key in ("method", "budget_total", "formal_sent", "budget_exhausted", "distinct_new_positive_c64", "distinct_last_hop_router_addresses")}, "probes_per_new_discovery": summary["formal_sent"] / discoveries if discoveries else "", "stages": json.dumps(summary["stages"], sort_keys=True)})
     with gzip.open(curve_path, "wt", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=("method", "attributed_probe_cost", "distinct_new_positive_c64"))
+        writer = csv.DictWriter(fh, fieldnames=("method", "probe_cost", "distinct_new_positive_c64"))
         writer.writeheader()
         for summary in summaries:
             writer.writerows(cost_curve(root / summary["method"], summary, args.curve_interval))
