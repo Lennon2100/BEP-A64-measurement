@@ -15,7 +15,6 @@ import gzip
 import importlib
 import io
 import ipaddress
-import itertools
 import json
 import os
 import shutil
@@ -55,6 +54,7 @@ class BatchContext:
     targets: Targets
     routers: set
     stages: Counter
+    legacy_recovery: bool = False
 
 
 def absolute(base, value):
@@ -107,6 +107,17 @@ def load_checkpoint(archives):
             return json.load(io.TextIOWrapper(fh, encoding="utf-8"))
 
 
+def load_recovered_targets(output, targets):
+    recovery_batches = list(targets.recovery_batches)
+    for batch_number in recovery_batches:
+        archive = output / f"batch-{batch_number:09d}.tar.gz"
+        with tarfile.open(archive, "r:gz") as bundle:
+            with bundle.extractfile("manifest.csv") as raw:
+                reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8", newline=""))
+                c64_values = [int(ipaddress.ip_network(row["c64"]).network_address) >> 64 for row in reader]
+        targets.add_recovered(c64_values, batch_number, reseed=False)
+
+
 def parse_scanned_batch(folder, context):
     parsed = folder / "probes.csv"
     feedback = folder / "feedback.csv"
@@ -137,6 +148,11 @@ def apply_batch_feedback(folder, context):
 def finish_scanned_batch(folder, archive, batch_number, context):
     parse_scanned_batch(folder, context)
     apply_batch_feedback(folder, context)
+    if context.legacy_recovery:
+        rebuild = getattr(context.strategy, "rebuild_after_recovery", None)
+        if rebuild is not None:
+            rebuild()
+        context.legacy_recovery = False
     checkpoint = {
         "strategy": context.strategy.snapshot(), "targets": context.targets.snapshot(),
         "last_hop_routers": sorted(context.routers),
@@ -148,27 +164,24 @@ def finish_scanned_batch(folder, archive, batch_number, context):
     write_json_atomic(archive.parent / "state.json", checkpoint)
 
 
-def replay_scanned_targets(folder, limit, context):
-    """Advance compact state over a scanned batch without sending it again."""
+def adopt_scanned_manifest(folder, batch_number, context):
+    """Adopt one legacy scanned batch whose prepared checkpoint is absent."""
+    c64_values = []
+    actions = []
+    seen_actions = set()
     with open(folder / "manifest.csv", newline="", encoding="utf-8") as fh:
-        recorded = csv.DictReader(fh)
-        generated = context.strategy.iter_targets(limit)
-        count = 0
-        for row, item in itertools.zip_longest(recorded, generated):
-            if row is None or item is None:
-                raise ValueError("unfinished manifest does not match regenerated target count")
-            c64, node, mode = item
-            expected = (
-                str(ipaddress.ip_network((c64 << 64, 64))), node, mode,
-                context.targets.address(c64),
-            )
-            actual = (row["c64"], row["node"], row["mode"], row["target_ipv6"])
-            if actual != expected:
-                raise ValueError("unfinished manifest differs from compact pre-batch state")
-            context.stages[mode] += 1
-            count += 1
-    if count == 0:
+        for row in csv.DictReader(fh):
+            c64_values.append(int(ipaddress.ip_network(row["c64"]).network_address) >> 64)
+            action = (row["node"], row["mode"])
+            if action not in seen_actions:
+                actions.append(action)
+                seen_actions.add(action)
+            context.stages[row["mode"]] += 1
+    if not c64_values:
         raise ValueError("unfinished manifest is empty")
+    context.strategy.adopt_manifest_actions(actions)
+    context.targets.add_recovered(c64_values, batch_number)
+    context.legacy_recovery = True
 
 
 def run_method(config_path, method, resume=False):
@@ -221,6 +234,7 @@ def run_method(config_path, method, resume=False):
         if state:
             strategy.restore(state["strategy"])
             targets.restore(state["targets"])
+            load_recovered_targets(output, targets)
             last_hop_routers.update(state["last_hop_routers"])
             stage_counts.update(state["stages"])
 
@@ -232,8 +246,20 @@ def run_method(config_path, method, resume=False):
             required = ("manifest.csv", "raw-zmap.csv", "scan.log")
             if any(not (expected_work / name).is_file() for name in required):
                 raise ValueError("unfinished batch has no complete scan evidence; inspect it manually")
-            limit = min(int(cfg["batch_size"]), allowance - strategy.sent)
-            replay_scanned_targets(expected_work, limit, batch_context)
+            scan_completed = (expected_work / "scan-complete").is_file()
+            legacy_parser_started = (expected_work / "probes.csv").is_file()
+            if not scan_completed and not legacy_parser_started:
+                raise ValueError("unfinished batch has no completed-scan marker; inspect it manually")
+            prepared_path = expected_work / "prepared-state.json"
+            if prepared_path.is_file():
+                prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
+                strategy.restore(prepared["strategy"])
+                targets.restore(prepared["targets"])
+                load_recovered_targets(output, targets)
+                stage_counts.clear()
+                stage_counts.update(prepared["stages"])
+            else:
+                adopt_scanned_manifest(expected_work, batch_number + 1, batch_context)
             batch_number += 1
             finish_scanned_batch(
                 expected_work, output / f"batch-{batch_number:09d}.tar.gz",
@@ -280,6 +306,12 @@ def run_method(config_path, method, resume=False):
             batch_number -= 1
             break
 
+        write_json_atomic(folder / "prepared-state.json", {
+            "strategy": strategy.snapshot(),
+            "targets": targets.snapshot(),
+            "stages": dict(stage_counts),
+        })
+
         command = [
             "bash", str(run_scan), str(zmap), str(sent), str(raw),
             scanner["source_ipv6"], scanner["interface"], scanner["gateway_mac"],
@@ -287,6 +319,7 @@ def run_method(config_path, method, resume=False):
         ]
         with open(folder / "scan.log", "w", encoding="utf-8") as log:
             subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        (folder / "scan-complete").touch()
         finish_scanned_batch(
             folder, archive, batch_number, batch_context,
         )

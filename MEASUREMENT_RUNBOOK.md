@@ -20,7 +20,7 @@
 ## 时间与空间复杂度
 
 - 每反馈轮次：决策 O(动作数 × 树深)（后验按 epoch 记忆化，一次评分只沿祖先链最多 64 跳）+ 目标流式生成 O(批大小)。
-- 常驻内存：策略侧 O(活跃节点)，包括节点聚合、前沿堆与确定性置换游标；解析侧 O(单批响应数 + 单批动作数)，不随历史累计探针数增长。
+- 常驻内存：正常路径的策略侧为 O(活跃节点)，包括节点聚合、前沿堆与确定性置换游标；解析侧为 O(单批响应数 + 单批动作数)。接管当前两个旧 `.work` 后，每个方法会额外保留至多一个批次（100 万个）的有序 `/64` 恢复排除索引；它不随以后正常完成的批次数增长。
 - **仍随总探针数增长的内容**只有必须保留的逐批磁盘证据归档。恢复状态、节点聚合和游标是 O(活跃节点)，不再保存 Python 全程去重集合或 `probed-*.bin`。
 
 ## 输入与配置
@@ -73,7 +73,7 @@ sudo python3 scripts/run_formal.py formal.json journal --resume
 sudo python3 scripts/run_formal.py formal.json subrecon --resume
 ```
 
-若 ZMap 已完成但 parser 失败，保留对应的下一批 `.work`。`--resume` 会从最后一个完整归档恢复，确定性重生成并逐行比较该 `.work/manifest.csv`，然后只解析已有 `raw-zmap.csv`、写 checkpoint 并压缩归档；该恢复路径不会再次调用 ZMap。当前已知恢复对象是 journal 的 `batch-000000004.work` 和 SubRecon 的 `batch-000000061.work`。若 manifest 与恢复状态不一致，runner 会停止，不能绕过后重发。
+若 ZMap 已完成但 parser 失败，保留对应的下一批 `.work`。旧 `.work` 没有生成后 checkpoint 时，`--resume` 以其已发送 manifest 为事实，登记该批 `/64` 为恢复排除项，应用已有 raw 反馈并归档，不再次调用 ZMap。新批次在发包前写 `prepared-state.json`，以后同类失败可直接恢复生成后状态。当前恢复对象是 journal 的 `batch-000000004.work` 和 SubRecon 的 `batch-000000061.work`。
 
 续跑直接读取最新完成归档内的 `state.json`（紧凑节点聚合、前沿状态与置换游标），**不重放历史逐探针记录**；启动成本和常驻策略状态均为 O(活跃节点)。批后 `state.json` 先写入批目录、再随批归档，归档是唯一原子提交点；归档完成前中断会遗留 `.work` 或 `.tar.gz.part`，阻止自动续跑。
 

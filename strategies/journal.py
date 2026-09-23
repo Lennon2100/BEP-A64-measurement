@@ -273,6 +273,35 @@ class Strategy:
         self._touched.clear()
         self.epoch += 1
 
+    def adopt_manifest_actions(self, actions):
+        root_indexes = {root: index for index, root in enumerate(self.root_order)}
+        for node_str, _ in actions:
+            node = ipaddress.ip_network(node_str)
+            if node not in self.nodes:
+                parent = next(
+                    (
+                        node.supernet(new_prefix=length)
+                        for length in range(node.prefixlen - 1, -1, -1)
+                        if node.supernet(new_prefix=length) in self.nodes
+                    ),
+                    None,
+                )
+                self._activate(node, parent)
+            if node in root_indexes:
+                self.root_index = max(self.root_index, root_indexes[node] + 1)
+            self._touched.add(node)
+
+    def rebuild_after_recovery(self):
+        parents = {rec["parent"] for rec in self.nodes.values() if rec["parent"] is not None}
+        self.heap = []
+        self.seq = 0
+        for node, rec in self.nodes.items():
+            if rec["closed"] or node in parents:
+                continue
+            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
+                continue
+            self._heap_push(node)
+
     def snapshot(self):
         return {
             "nodes": {
@@ -292,6 +321,9 @@ class Strategy:
             "positive_count": self.positive_count,
             "root_index": self.root_index,
             "epoch": self.epoch,
+            "heap": [[score, seq, str(node)] for score, seq, node in self.heap],
+            "seq": self.seq,
+            "touched": [str(node) for node in self._touched],
         }
 
     def restore(self, state):
@@ -314,8 +346,17 @@ class Strategy:
         self.root_index = state["root_index"]
         self.epoch = state["epoch"]
         self.cache = {}
-        self.heap = []
-        self.seq = 0
+        self.heap = [
+            (score, seq, ipaddress.ip_network(node))
+            for score, seq, node in state.get("heap", [])
+        ]
+        self.seq = state.get("seq", 0)
+        self._touched = {ipaddress.ip_network(node) for node in state.get("touched", [])}
+        if "heap" in state:
+            for score, _, node in self.heap:
+                self.nodes[node]["heap_score"] = -score
+            heapq.heapify(self.heap)
+            return
         for node, rec in self.nodes.items():
             if rec["closed"]:
                 continue

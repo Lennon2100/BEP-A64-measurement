@@ -11,6 +11,7 @@ The generator state (`rng` + per-prefix permutation cursors) is snapshot/restore
 compatible so a run can resume without replaying completed batches.
 """
 
+import bisect
 import csv
 import ipaddress
 import random
@@ -67,6 +68,8 @@ class Targets:
         self.seed = seed
         self.rng = random.Random(seed)
         self.positions = {}        # prefix -> [offset, stride, cursor]
+        self.recovered = []        # sorted exceptional legacy-recovery /64s
+        self.recovery_batches = []
 
     def _position(self, prefix):
         count = 1 << (64 - prefix.prefixlen)
@@ -104,12 +107,14 @@ class Targets:
         """Count distinct earlier targets inside a newly activated descendant."""
         start = int(prefix.network_address) >> 64
         stop = start + (1 << (64 - prefix.prefixlen))
-        return len({
+        prior = {
             value
             for ancestor in ancestors
             for value in self.drawn_values(ancestor)
             if start <= value < stop
-        })
+        }
+        prior.update(self.recovered[bisect.bisect_left(self.recovered, start):bisect.bisect_left(self.recovered, stop)])
+        return len(prior)
 
     def draw(self, prefix, ancestors=()):
         """Return the next unprobed /64 in `prefix`'s permutation, or None."""
@@ -119,7 +124,9 @@ class Targets:
         while position[2] < count:
             value = start + ((position[0] + position[1] * position[2]) % count)
             position[2] += 1
-            if not any(self.was_drawn(ancestor, value) for ancestor in ancestors):
+            recovered_at = bisect.bisect_left(self.recovered, value)
+            was_recovered = recovered_at < len(self.recovered) and self.recovered[recovered_at] == value
+            if not was_recovered and not any(self.was_drawn(ancestor, value) for ancestor in ancestors):
                 return value
         return None
 
@@ -133,6 +140,7 @@ class Targets:
             "seed": self.seed,
             "rng": self.rng.getstate(),
             "positions": {str(p): list(v) for p, v in self.positions.items()},
+            "recovery_batches": self.recovery_batches,
         }
 
     def restore(self, state):
@@ -145,3 +153,12 @@ class Targets:
         self.positions = {
             ipaddress.ip_network(p): list(v) for p, v in state["positions"].items()
         }
+        self.recovered = []
+        self.recovery_batches = list(state.get("recovery_batches", []))
+
+    def add_recovered(self, c64_values, batch_number, reseed=True):
+        self.recovered = sorted(set(self.recovered).union(c64_values))
+        if batch_number not in self.recovery_batches:
+            self.recovery_batches.append(batch_number)
+        if reseed:
+            self.rng = random.Random(f"{self.seed}:recovery:{batch_number}")

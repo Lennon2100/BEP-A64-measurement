@@ -105,12 +105,18 @@ archive. A `.tar.gz.part` or a `.work` directory without complete raw scan
 evidence blocks automatic resume and requires manual inspection.
 
 If scanning completed and only formal parsing failed, keep the next `.work`
-directory and run with `--resume`. The runner restores the previous archive,
-regenerates and compares that batch's deterministic manifest, then parses and
-archives the existing raw CSV without invoking ZMap again. Formal parsing
+directory and run with `--resume`. For a legacy `.work` without a prepared
+checkpoint, the runner adopts its already-sent manifest, excludes those `/64`s
+from future targets, then parses and archives the existing raw CSV without
+invoking ZMap again. New batches save `prepared-state.json` before scanning, so
+later parser failures restore the exact post-generation state. Formal parsing
 charges one target once even when it produced several response classes: any
 matched IMC-positive response makes it positive, raw CSV retains every reply,
 and every AU source is retained as last-hop-router evidence.
+
+The legacy adoption keeps one sorted batch-sized exclusion index in memory and
+reconstructs it from that batch archive on restart. New completed batches do
+not enlarge this exceptional index.
 
 Resume reads the newest archive's `state.json` (per-node aggregates and
 deterministic generator cursors). It does **not** replay completed archives or

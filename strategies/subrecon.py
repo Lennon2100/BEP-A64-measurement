@@ -102,6 +102,26 @@ class Strategy:
     def finish_batch(self):
         pass
 
+    def adopt_manifest_actions(self, actions):
+        adopted = []
+        for node_str, _ in actions:
+            node = ipaddress.ip_network(node_str)
+            adopted.append(node)
+            if node not in self.nodes:
+                parent = next(
+                    (
+                        node.supernet(new_prefix=length)
+                        for length in range(node.prefixlen - 1, -1, -1)
+                        if node.supernet(new_prefix=length) in self.nodes
+                    ),
+                    None,
+                )
+                self._activate(node, parent)
+                self.seen.add(node)
+        adopted_set = set(adopted)
+        self.queue = deque(prefix for prefix in self.queue if prefix not in adopted_set)
+        self.queue.extend(adopted)
+
     def snapshot(self):
         return {
             "queue": [str(p) for p in self.queue],
