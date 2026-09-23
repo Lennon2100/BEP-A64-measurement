@@ -13,8 +13,10 @@ compatible so a run can resume without replaying completed batches.
 
 import bisect
 import csv
+import heapq
 import ipaddress
 import random
+from array import array
 from collections import defaultdict
 
 from scripts.count_prefix_nesting import build_immediate_parent_map
@@ -68,7 +70,7 @@ class Targets:
         self.seed = seed
         self.rng = random.Random(seed)
         self.positions = {}        # prefix -> [offset, stride, cursor]
-        self.recovered = []        # sorted exceptional legacy-recovery /64s
+        self.recovered = array("Q")  # sorted exceptional legacy-recovery /64s
         self.recovery_batches = []
 
     def _position(self, prefix):
@@ -153,11 +155,21 @@ class Targets:
         self.positions = {
             ipaddress.ip_network(p): list(v) for p, v in state["positions"].items()
         }
-        self.recovered = []
+        self.recovered = array("Q")
         self.recovery_batches = list(state.get("recovery_batches", []))
 
     def add_recovered(self, c64_values, batch_number, reseed=True):
-        self.recovered = sorted(set(self.recovered).union(c64_values))
+        recovered_batch = array("Q", c64_values)
+        if self.recovered:
+            merged = array("Q")
+            previous = None
+            for c64 in heapq.merge(self.recovered, recovered_batch):
+                if c64 != previous:
+                    merged.append(c64)
+                    previous = c64
+            self.recovered = merged
+        else:
+            self.recovered = recovered_batch
         if batch_number not in self.recovery_batches:
             self.recovery_batches.append(batch_number)
         if reseed:

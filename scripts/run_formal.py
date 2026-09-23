@@ -115,6 +115,7 @@ def load_recovered_targets(output, targets):
             with bundle.extractfile("manifest.csv") as raw:
                 reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8", newline=""))
                 c64_values = [int(ipaddress.ip_network(row["c64"]).network_address) >> 64 for row in reader]
+        c64_values.sort()
         targets.add_recovered(c64_values, batch_number, reseed=False)
 
 
@@ -179,6 +180,7 @@ def adopt_scanned_manifest(folder, batch_number, context):
             context.stages[row["mode"]] += 1
     if not c64_values:
         raise ValueError("unfinished manifest is empty")
+    c64_values.sort()
     context.strategy.adopt_manifest_actions(actions)
     context.targets.add_recovered(c64_values, batch_number)
     context.legacy_recovery = True
@@ -259,8 +261,10 @@ def run_method(config_path, method, resume=False):
                 stage_counts.clear()
                 stage_counts.update(prepared["stages"])
             else:
+                print(f"adopting already-sent {expected_work.name}", file=sys.stderr, flush=True)
                 adopt_scanned_manifest(expected_work, batch_number + 1, batch_context)
             batch_number += 1
+            print(f"parsing existing raw output for {expected_work.name}", file=sys.stderr, flush=True)
             finish_scanned_batch(
                 expected_work, output / f"batch-{batch_number:09d}.tar.gz",
                 batch_number, batch_context,

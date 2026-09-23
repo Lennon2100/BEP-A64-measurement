@@ -3,12 +3,14 @@
 
 import argparse
 import csv
+import ipaddress
 import json
 import os
 import sys
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 
-from parse_results import RAW_FIELDS, canonical_ipv6, parse_int, response_class, timing_ms
+from parse_results import RAW_FIELDS, parse_int, response_class, timing_ms
 
 
 PROBE_FIELDS = [
@@ -22,9 +24,55 @@ ROUTER_FIELDS = [
 ]
 FEEDBACK_FIELDS = ["node", "mode", "probes", "positives", "replies", "sources"]
 
+CLASS_BITS = {
+    "direct": 1,
+    "slow_au": 2,
+    "fast_au": 4,
+    "other_error": 8,
+}
+REPLY_CLASSES = {"direct", "slow_au", "fast_au"}
+
+
+@dataclass(slots=True)
+class ResponseAggregate:
+    count: int = 0
+    class_mask: int = 0
+    positive: bool = False
+    reply: bool = False
+    representative: tuple | None = None
+    au_sources: dict | None = None
+
+    def add(self, cls, positive, observation):
+        source, rtt, line, is_au = observation
+        self.count += 1
+        self.class_mask |= CLASS_BITS[cls]
+        self.reply |= cls in REPLY_CLASSES
+        candidate = (rtt, cls, source, line)
+        if positive:
+            if not self.positive or rtt < self.representative[0]:
+                self.representative = candidate
+            self.positive = True
+        elif not self.positive and (
+            self.representative is None or rtt < self.representative[0]
+        ):
+            self.representative = candidate
+        if is_au and source is not None:
+            if self.au_sources is None:
+                self.au_sources = {}
+            previous = self.au_sources.get(source)
+            if previous is None or rtt < previous[0]:
+                self.au_sources[source] = (rtt, cls, line)
+
+
+def ipv6_int(text):
+    address = ipaddress.ip_address(text.strip())
+    if address.version != 6:
+        raise ValueError(f"not an IPv6 address: {text}")
+    return int(address)
+
 
 def load_raw(path, threshold):
-    responses = defaultdict(list)
+    responses = {}
     invalid = 0
     rows = 0
     with open(path, newline="", encoding="utf-8") as fh:
@@ -35,20 +83,20 @@ def load_raw(path, threshold):
         for line_number, row in enumerate(reader, 2):
             rows += 1
             try:
-                target = canonical_ipv6(row["orig-dest-ip"])
+                target = ipv6_int(row["orig-dest-ip"])
                 icmp_type = parse_int(row, "type")
                 icmp_code = parse_int(row, "code")
                 rtt = timing_ms(row)
                 cls, positive = response_class(icmp_type, icmp_code, rtt, threshold)
-                source = canonical_ipv6(row["saddr"]) if row.get("saddr") else ""
+                source = ipv6_int(row["saddr"]) if row.get("saddr") else None
             except ValueError:
                 invalid += 1
                 continue
-            responses[target].append({
-                "class": cls, "positive": positive, "source": source,
-                "rtt": f"{rtt:.3f}", "elapsed": rtt, "line": line_number,
-                "is_au": icmp_type == 1 and icmp_code == 3,
-            })
+            aggregate = responses.get(target)
+            if aggregate is None:
+                aggregate = responses[target] = ResponseAggregate()
+            observation = (source, rtt, line_number, icmp_type == 1 and icmp_code == 3)
+            aggregate.add(cls, positive, observation)
     return responses, rows, invalid
 
 
@@ -84,41 +132,38 @@ def main(argv=None):
             router_writer.writeheader()
             for row in reader:
                 planned += 1
-                target = canonical_ipv6(row["target_ipv6"])
-                found = responses.pop(target, [])
+                target_number = ipv6_int(row["target_ipv6"])
+                target = str(ipaddress.IPv6Address(target_number))
+                found = responses.pop(target_number, None)
                 if found:
-                    response_classes = {item["class"] for item in found}
-                    cross_class += len(response_classes) > 1
+                    cross_class += found.class_mask.bit_count() > 1
                     # One sent target is one budget item.  Prefer the first
                     # positive arrival when any response satisfies the IMC
                     # rule; otherwise retain the first arrival.  The raw CSV
                     # remains the complete multi-response evidence.
-                    positive_responses = [candidate for candidate in found if candidate["positive"]]
-                    item = min(positive_responses or found, key=lambda candidate: candidate["elapsed"])
-                    multi += len(found) > 1
+                    rtt, cls, source, raw_line = found.representative
+                    multi += found.count > 1
                     status = "matched"
-                    cls = item["class"]
-                    positive = int(any(candidate["positive"] for candidate in found))
+                    positive = int(found.positive)
                 else:
-                    item = {"source": "", "rtt": "", "line": "", "is_au": False}
+                    source = rtt = raw_line = None
                     status, cls, positive = "timeout", "timeout", 0
                 key = (row["node"], row["mode"])
                 aggregate = feedback[key]
                 aggregate["probes"] += 1
                 aggregate["positives"] += positive
-                aggregate["replies"] += any(
-                    candidate["class"] in ("direct", "slow_au", "fast_au")
-                    for candidate in found
-                )
-                for candidate in found:
-                    if candidate["is_au"] and candidate["source"]:
-                        aggregate["sources"].add(candidate["source"])
-                        router_writer.writerow({
-                            "probe_id": row["probe_id"], "c64": row["c64"],
-                            "target_ipv6": target, "router_ipv6": candidate["source"],
-                            "response_class": candidate["class"], "rtt_ms": candidate["rtt"],
-                            "raw_row_number": candidate["line"],
-                        })
+                aggregate["replies"] += bool(found and found.reply)
+                for router, observation in (found.au_sources or {}).items() if found else ():
+                    router_text = str(ipaddress.IPv6Address(router))
+                    router_rtt, router_class, router_line = observation
+                    aggregate["sources"].add(router_text)
+                    router_writer.writerow({
+                        "probe_id": row["probe_id"], "c64": row["c64"],
+                        "target_ipv6": target, "router_ipv6": router_text,
+                        "response_class": router_class,
+                        "rtt_ms": f"{router_rtt:.3f}",
+                        "raw_row_number": router_line,
+                    })
                 positives += positive
                 statuses[status] += 1
                 classes[cls] += 1
@@ -127,8 +172,9 @@ def main(argv=None):
                     "mode": row["mode"], "c64": row["c64"],
                     "target_ipv6": target, "match_status": status,
                     "response_class": cls, "is_observed_positive": positive,
-                    "icmp_source": item["source"], "rtt_ms": item["rtt"],
-                    "raw_row_number": item["line"],
+                    "icmp_source": str(ipaddress.IPv6Address(source)) if source is not None else "",
+                    "rtt_ms": f"{rtt:.3f}" if rtt is not None else "",
+                    "raw_row_number": raw_line if raw_line is not None else "",
                 })
 
         with open(args.feedback, "w", newline="", encoding="utf-8") as fh:
