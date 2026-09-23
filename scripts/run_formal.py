@@ -15,6 +15,7 @@ import gzip
 import importlib
 import io
 import ipaddress
+import itertools
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ import subprocess
 import sys
 import tarfile
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +45,16 @@ ARCHIVE_FILES = (
     "last-hop-router-observations.csv",
     "state.json",
 )
+
+
+@dataclass
+class BatchContext:
+    parser: Path
+    threshold: int
+    strategy: object
+    targets: Targets
+    routers: set
+    stages: Counter
 
 
 def absolute(base, value):
@@ -95,6 +107,70 @@ def load_checkpoint(archives):
             return json.load(io.TextIOWrapper(fh, encoding="utf-8"))
 
 
+def parse_scanned_batch(folder, context):
+    parsed = folder / "probes.csv"
+    feedback = folder / "feedback.csv"
+    router_obs = folder / "last-hop-router-observations.csv"
+    for path in (parsed, Path(str(parsed) + ".summary.json"), feedback, router_obs):
+        path.unlink(missing_ok=True)
+    subprocess.run(
+        [sys.executable, str(context.parser), str(folder / "manifest.csv"),
+         str(folder / "raw-zmap.csv"), str(parsed), str(feedback), str(router_obs),
+         "--slow-au-threshold-ms", str(context.threshold)],
+        check=True, stdout=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
+def apply_batch_feedback(folder, context):
+    router_obs = folder / "last-hop-router-observations.csv"
+    with open(router_obs, newline="", encoding="utf-8") as fh:
+        context.routers.update(row["router_ipv6"] for row in csv.DictReader(fh))
+    with open(folder / "feedback.csv", newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            context.strategy.feed_aggregate(
+                row["node"], row["mode"], int(row["probes"]),
+                int(row["positives"]), int(row["replies"]), json.loads(row["sources"]),
+            )
+    context.strategy.finish_batch()
+
+
+def finish_scanned_batch(folder, archive, batch_number, context):
+    parse_scanned_batch(folder, context)
+    apply_batch_feedback(folder, context)
+    checkpoint = {
+        "strategy": context.strategy.snapshot(), "targets": context.targets.snapshot(),
+        "last_hop_routers": sorted(context.routers),
+        "batch_number": batch_number, "stages": dict(context.stages),
+    }
+    write_json_atomic(folder / "state.json", checkpoint)
+    (folder / "sent-targets.txt").unlink(missing_ok=True)
+    archive_batch(folder, archive)
+    write_json_atomic(archive.parent / "state.json", checkpoint)
+
+
+def replay_scanned_targets(folder, limit, context):
+    """Advance compact state over a scanned batch without sending it again."""
+    with open(folder / "manifest.csv", newline="", encoding="utf-8") as fh:
+        recorded = csv.DictReader(fh)
+        generated = context.strategy.iter_targets(limit)
+        count = 0
+        for row, item in itertools.zip_longest(recorded, generated):
+            if row is None or item is None:
+                raise ValueError("unfinished manifest does not match regenerated target count")
+            c64, node, mode = item
+            expected = (
+                str(ipaddress.ip_network((c64 << 64, 64))), node, mode,
+                context.targets.address(c64),
+            )
+            actual = (row["c64"], row["node"], row["mode"], row["target_ipv6"])
+            if actual != expected:
+                raise ValueError("unfinished manifest differs from compact pre-batch state")
+            context.stages[mode] += 1
+            count += 1
+    if count == 0:
+        raise ValueError("unfinished manifest is empty")
+
+
 def run_method(config_path, method, resume=False):
     base = config_path.resolve().parent
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
@@ -127,24 +203,42 @@ def run_method(config_path, method, resume=False):
     last_hop_routers = set()
     stage_counts = Counter()
     batch_number = 0
+    batch_context = BatchContext(
+        parsed_script, cfg["slow_au_threshold_ms"], strategy, targets,
+        last_hop_routers, stage_counts,
+    )
 
     if resume:
         archives = sorted(output.glob("batch-*.tar.gz"))
-        state = load_checkpoint(archives)
-        batch_number = state["batch_number"]
+        state = load_checkpoint(archives) if archives else None
+        batch_number = state["batch_number"] if state else 0
         expected = [f"batch-{number:09d}.tar.gz" for number in range(1, batch_number + 1)]
         if [archive.name for archive in archives] != expected:
             raise ValueError("archive sequence does not match its latest checkpoint")
-        unfinished = (
-            list(output.glob("batch-*.work"))
-            + list(output.glob("batch-*.tar.gz.part"))
-        )
-        if unfinished:
-            raise ValueError(f"unfinished batch cannot be replayed automatically: {unfinished[0]}")
-        strategy.restore(state["strategy"])
-        targets.restore(state["targets"])
-        last_hop_routers = set(state["last_hop_routers"])
-        stage_counts = Counter(state["stages"])
+        parts = list(output.glob("batch-*.tar.gz.part"))
+        if parts:
+            raise ValueError(f"incomplete archive requires manual inspection: {parts[0]}")
+        if state:
+            strategy.restore(state["strategy"])
+            targets.restore(state["targets"])
+            last_hop_routers.update(state["last_hop_routers"])
+            stage_counts.update(state["stages"])
+
+        work = list(output.glob("batch-*.work"))
+        if work:
+            expected_work = output / f"batch-{batch_number + 1:09d}.work"
+            if work != [expected_work]:
+                raise ValueError("expected exactly the next unfinished batch work directory")
+            required = ("manifest.csv", "raw-zmap.csv", "scan.log")
+            if any(not (expected_work / name).is_file() for name in required):
+                raise ValueError("unfinished batch has no complete scan evidence; inspect it manually")
+            limit = min(int(cfg["batch_size"]), allowance - strategy.sent)
+            replay_scanned_targets(expected_work, limit, batch_context)
+            batch_number += 1
+            finish_scanned_batch(
+                expected_work, output / f"batch-{batch_number:09d}.tar.gz",
+                batch_number, batch_context,
+            )
     else:
         output.mkdir(parents=True)
         shutil.copyfile(config_path, output / "formal.json")
@@ -162,9 +256,6 @@ def run_method(config_path, method, resume=False):
         manifest = folder / "manifest.csv"
         sent = folder / "sent-targets.txt"
         raw = folder / "raw-zmap.csv"
-        parsed = folder / "probes.csv"
-        feedback = folder / "feedback.csv"
-        router_obs = folder / "last-hop-router-observations.csv"
 
         # Stream target generation; no in-memory batch lists.
         count = 0
@@ -196,34 +287,9 @@ def run_method(config_path, method, resume=False):
         ]
         with open(folder / "scan.log", "w", encoding="utf-8") as log:
             subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-        subprocess.run(
-            [sys.executable, str(parsed_script), str(manifest), str(raw), str(parsed),
-             str(feedback), str(router_obs),
-             "--slow-au-threshold-ms", str(cfg["slow_au_threshold_ms"]),
-             ],
-            check=True, stdout=subprocess.DEVNULL, start_new_session=True,
+        finish_scanned_batch(
+            folder, archive, batch_number, batch_context,
         )
-        with open(router_obs, newline="", encoding="utf-8") as fh:
-            last_hop_routers.update(row["router_ipv6"] for row in csv.DictReader(fh))
-
-        with open(feedback, newline="", encoding="utf-8") as fh:
-            for row in csv.DictReader(fh):
-                strategy.feed_aggregate(
-                    row["node"], row["mode"], int(row["probes"]),
-                    int(row["positives"]), int(row["replies"]), json.loads(row["sources"]),
-                )
-        strategy.finish_batch()
-
-        checkpoint = {
-            "strategy": strategy.snapshot(),
-            "targets": targets.snapshot(),
-            "last_hop_routers": sorted(last_hop_routers),
-            "batch_number": batch_number,
-            "stages": dict(stage_counts),
-        }
-        write_json_atomic(folder / "state.json", checkpoint)
-        sent.unlink()
-        archive_batch(folder, archive)
 
     if STOP_REQUESTED:
         return {"status": "paused", "method": method, "completed_batches": batch_number, "formal_sent": strategy.sent}
@@ -254,7 +320,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config")
     parser.add_argument("method", help="strategy module name under strategies/")
-    parser.add_argument("--resume", action="store_true", help="continue from the compact state, not from archives")
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="continue from the newest archived compact checkpoint",
+    )
     args = parser.parse_args()
 
     def request_stop(signum, frame):

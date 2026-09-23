@@ -101,9 +101,16 @@ command and version, raw ZMap CSV, compact parsed per-probe evidence, node
 feedback, matched AU router observations, and the post-batch checkpoint. The temporary `.work`
 directory is removed only after the archive has been written and read back.
 Compression temporarily needs space for both the working batch and its
-archive. An interrupted `.work` or `.tar.gz.part` blocks
-automatic resume because some probes may already have been sent; inspect the
-scan evidence before deciding what to do.
+archive. A `.tar.gz.part` or a `.work` directory without complete raw scan
+evidence blocks automatic resume and requires manual inspection.
+
+If scanning completed and only formal parsing failed, keep the next `.work`
+directory and run with `--resume`. The runner restores the previous archive,
+regenerates and compares that batch's deterministic manifest, then parses and
+archives the existing raw CSV without invoking ZMap again. Formal parsing
+charges one target once even when it produced several response classes: any
+matched IMC-positive response makes it positive, raw CSV retains every reply,
+and every AU source is retained as last-hop-router evidence.
 
 Resume reads the newest archive's `state.json` (per-node aggregates and
 deterministic generator cursors). It does **not** replay completed archives or

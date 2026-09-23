@@ -45,7 +45,7 @@
 | `strategies.journal.theta_b` | `1`；其余搜索系数见模板 |
 | `output_root` | `runs/formal-journal-subrecon-5b-v1`，首次运行应为空 |
 
-**可行性**：1000 pps 下每探针 1 ms，5B 探针纯发送约 57.9 天，与批次和冷却无关；30 s 冷却只是每轮固定的接收尾窗。1000 pps、100 万探针/批、30 s 尾窗时，每方法 5B 的理论纯发送与尾窗约 58 天，仍未计计算、解析和停机。5B 是配置上限而非已证可执行规模；首个实网运行应缩小到“天级”预算，并只在授权后提高 `rate_pps`。
+**可行性**：1000 pps 下每探针 1 ms，5B 探针纯发送约 57.9 天，与批次和冷却无关；30 s 冷却只是每轮固定的接收尾窗。1000 pps、100 万探针/批、30 s 尾窗时，每方法 5B 的理论纯发送与尾窗约 59.6 天，仍未计计算、解析和停机。5B 是配置上限而非已证可执行规模；继续长期运行前要用已完成批次的真实压缩率核对剩余存储和迁出能力。
 
 正式运行不读取 scan 排除表，也不要求 RIS 快照身份。Linux 主机需有上述两份 RIS CSV、frame 排除文件和已构建的 ZMap。扫描包装脚本向 ZMap 传入 `-i`、`--ipv6-source-ip`，并为此 fork 的 IPv4 初始化传入 `-S 0.0.0.0`；实际 IPv6 探针使用配置中的源 IPv6。ZMap 构建及扫描包装参数见 [README.md](README.md)。
 
@@ -64,12 +64,16 @@ python3 scripts/analyze_formal.py formal.json
 
 `analyze_formal.py` 只在配置中的方法均生成 `summary.json` 后运行。此前缺少该文件，是正式方法未完成的后续现象；分析器不绕过这个条件。
 
+同一目标可能收到多条甚至跨类别响应。正式 parser 保留完整 raw CSV，每个目标仍只计一次预算；只要任一匹配响应满足 IMC 规则，该 `/64` 就记为阳性。紧凑 `probes.csv` 选择第一条阳性到达（没有阳性时选择第一条到达），所有 AU 响应源均写入末跳证据，summary 记录多响应与跨类别目标数。
+
 需要暂停时，对 runner 发送一次 SIGINT（Ctrl+C）或 SIGTERM，等待当前批次扫描、解析、压缩完成并输出 `status: paused`。随后按方法续跑：
 
 ```bash
 sudo python3 scripts/run_formal.py formal.json journal --resume
 sudo python3 scripts/run_formal.py formal.json subrecon --resume
 ```
+
+若 ZMap 已完成但 parser 失败，保留对应的下一批 `.work`。`--resume` 会从最后一个完整归档恢复，确定性重生成并逐行比较该 `.work/manifest.csv`，然后只解析已有 `raw-zmap.csv`、写 checkpoint 并压缩归档；该恢复路径不会再次调用 ZMap。当前已知恢复对象是 journal 的 `batch-000000004.work` 和 SubRecon 的 `batch-000000061.work`。若 manifest 与恢复状态不一致，runner 会停止，不能绕过后重发。
 
 续跑直接读取最新完成归档内的 `state.json`（紧凑节点聚合、前沿状态与置换游标），**不重放历史逐探针记录**；启动成本和常驻策略状态均为 O(活跃节点)。批后 `state.json` 先写入批目录、再随批归档，归档是唯一原子提交点；归档完成前中断会遗留 `.work` 或 `.tar.gz.part`，阻止自动续跑。
 

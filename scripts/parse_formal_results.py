@@ -46,7 +46,7 @@ def load_raw(path, threshold):
                 continue
             responses[target].append({
                 "class": cls, "positive": positive, "source": source,
-                "rtt": f"{rtt:.3f}", "line": line_number,
+                "rtt": f"{rtt:.3f}", "elapsed": rtt, "line": line_number,
                 "is_au": icmp_type == 1 and icmp_code == 3,
             })
     return responses, rows, invalid
@@ -70,7 +70,7 @@ def main(argv=None):
         feedback = defaultdict(lambda: {"probes": 0, "positives": 0, "replies": 0, "sources": set()})
         statuses = Counter()
         classes = Counter()
-        planned = positives = multi = 0
+        planned = positives = multi = cross_class = 0
         with open(args.manifest, newline="", encoding="utf-8") as mf, \
              open(args.probes, "w", newline="", encoding="utf-8") as pf, \
              open(args.routers, "w", newline="", encoding="utf-8") as rf:
@@ -88,13 +88,17 @@ def main(argv=None):
                 found = responses.pop(target, [])
                 if found:
                     response_classes = {item["class"] for item in found}
-                    if len(response_classes) != 1:
-                        raise ValueError(f"multiple response classes for target {target}")
-                    item = found[0]
+                    cross_class += len(response_classes) > 1
+                    # One sent target is one budget item.  Prefer the first
+                    # positive arrival when any response satisfies the IMC
+                    # rule; otherwise retain the first arrival.  The raw CSV
+                    # remains the complete multi-response evidence.
+                    positive_responses = [candidate for candidate in found if candidate["positive"]]
+                    item = min(positive_responses or found, key=lambda candidate: candidate["elapsed"])
                     multi += len(found) > 1
                     status = "matched"
                     cls = item["class"]
-                    positive = item["positive"]
+                    positive = int(any(candidate["positive"] for candidate in found))
                 else:
                     item = {"source": "", "rtt": "", "line": "", "is_au": False}
                     status, cls, positive = "timeout", "timeout", 0
@@ -102,15 +106,19 @@ def main(argv=None):
                 aggregate = feedback[key]
                 aggregate["probes"] += 1
                 aggregate["positives"] += positive
-                aggregate["replies"] += cls in ("direct", "slow_au", "fast_au")
-                if item["is_au"] and item["source"]:
-                    aggregate["sources"].add(item["source"])
-                    router_writer.writerow({
-                        "probe_id": row["probe_id"], "c64": row["c64"],
-                        "target_ipv6": target, "router_ipv6": item["source"],
-                        "response_class": cls, "rtt_ms": item["rtt"],
-                        "raw_row_number": item["line"],
-                    })
+                aggregate["replies"] += any(
+                    candidate["class"] in ("direct", "slow_au", "fast_au")
+                    for candidate in found
+                )
+                for candidate in found:
+                    if candidate["is_au"] and candidate["source"]:
+                        aggregate["sources"].add(candidate["source"])
+                        router_writer.writerow({
+                            "probe_id": row["probe_id"], "c64": row["c64"],
+                            "target_ipv6": target, "router_ipv6": candidate["source"],
+                            "response_class": candidate["class"], "rtt_ms": candidate["rtt"],
+                            "raw_row_number": candidate["line"],
+                        })
                 positives += positive
                 statuses[status] += 1
                 classes[cls] += 1
@@ -137,6 +145,7 @@ def main(argv=None):
             "invalid_raw_row_count": invalid_count,
             "unmatched_raw_target_count": len(responses),
             "multi_response_target_count": multi,
+            "cross_class_target_count": cross_class,
             "observed_positive_count": positives,
             "match_status_counts": dict(statuses),
             "response_class_counts": dict(classes),
