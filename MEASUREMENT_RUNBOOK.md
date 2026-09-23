@@ -73,11 +73,11 @@ sudo python3 scripts/run_formal.py formal.json journal --resume
 sudo python3 scripts/run_formal.py formal.json subrecon --resume
 ```
 
-若 ZMap 已完成但 parser 失败，保留对应的下一批 `.work`。旧 `.work` 没有生成后 checkpoint 时，`--resume` 以其已发送 manifest 为事实，登记该批 `/64` 为恢复排除项，应用已有 raw 反馈并归档，不再次调用 ZMap。新批次在发包前写 `prepared-state.json`，以后同类失败可直接恢复生成后状态。当前恢复对象是 journal 的 `batch-000000004.work` 和 SubRecon 的 `batch-000000061.work`。
+若 ZMap 已完成但 parser 失败，保留对应的下一批 `.work`。旧 `.work` 没有生成后 checkpoint 时，`--resume` 以其已发送 manifest 为事实，登记该批 `/64` 为恢复排除项，应用已有 raw 反馈并归档，不再次调用 ZMap。新批次在发包前写 `prepared-state.pkl.gz`，以后同类失败可直接恢复生成后状态。若目录只有 `manifest.csv` 和 `sent-targets.txt`、完全没有扫描产物，说明中断发生在发包前；`--resume` 会删除并重新生成这一批。
 
-续跑直接读取最新完成归档内的 `state.json`（紧凑节点聚合、前沿状态与置换游标），**不重放历史逐探针记录**；启动成本和常驻策略状态均为 O(活跃节点)。批后 `state.json` 先写入批目录、再随批归档，归档是唯一原子提交点；归档完成前中断会遗留 `.work` 或 `.tar.gz.part`，阻止自动续跑。
+续跑兼容读取旧归档的 `state.json`，新归档使用流式写入的 `state.pkl.gz`（紧凑节点聚合、前沿状态与置换游标），**不重放历史逐探针记录**。运行状态为 O(活跃节点)，写检查点不再复制完整节点图或构造完整 JSON 字符串。批后检查点先写入批目录、再随批归档，归档是唯一原子提交点。
 
-每个完成批次保存为 `batch-000000001.tar.gz` 等压缩包，内含唯一且保持发送顺序的 `manifest.csv`、实际命令、扫描器版本、原始 ZMap CSV、紧凑逐探针证据、节点级反馈、末跳源地址证据、批后 `state.json` 和日志。临时 `sent-targets.txt` 与 manifest 的 `target_ipv6` 列重复，扫描结束后即删除。压缩包写完并读回后，runner 删除对应 `.work/`；压缩期间磁盘要同时容纳该批原文件和压缩包。若进程在批次中途被强制终止，遗留的 `.work/` 或 `.tar.gz.part` 会阻止自动续跑，因为该批可能已有探针发出；必须先人工核对实际发包情况。
+每个完成批次保存为 `batch-000000001.tar.gz` 等压缩包，内含唯一且保持发送顺序的 `manifest.csv`、实际命令、扫描器版本、原始 ZMap CSV、紧凑逐探针证据、节点级反馈、末跳源地址证据、批后 `state.pkl.gz` 和日志。临时 `sent-targets.txt` 与 manifest 的 `target_ipv6` 列重复，扫描结束后即删除。压缩包写完并读回后，runner 删除对应 `.work/`；压缩期间磁盘要同时容纳该批原文件和压缩包。有扫描产物但证据不完整的 `.work/` 仍要求人工核对，避免重发。
 
 ## 输出与比较
 
@@ -86,7 +86,7 @@ sudo python3 scripts/run_formal.py formal.json subrecon --resume
 ## 磁盘增长估算（每批 B 个探针、全程 T 个探针）
 
 - 工作目录单批仍由 `manifest.csv`、`probes.csv` 与原始 ZMap CSV 主导；按当前短字段预计未压缩约 0.3–0.6 KB/探针，压缩比必须以首个真实批次实测，不能把估算当容量保证。
-- 全程磁盘是 O(T) 的原始证据归档；`state.json` 为 O(活跃节点)。若压缩后为 0.05–0.15 KB/探针，T=10^8 约 5–15 GB，T=5×10^9 约 250–750 GB；正式 5B 前必须按真实首批压缩率确认外置存储和迁出流程。
+- 全程磁盘是 O(T) 的原始证据归档；`state.pkl.gz` 为 O(活跃节点)。若压缩后为 0.05–0.15 KB/探针，T=10^8 约 5–15 GB，T=5×10^9 约 250–750 GB；正式 5B 前必须按真实首批压缩率确认外置存储和迁出流程。
 
 ## 旧运行目录的安全处理
 

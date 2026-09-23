@@ -141,7 +141,27 @@ class Strategy:
             "positive_count": self.positive_count,
         }
 
+    def checkpoint(self):
+        """Return live aggregate state without copying active-prefix records."""
+        return {
+            "native": True,
+            "queue": self.queue,
+            "seen": self.seen,
+            "nodes": self.nodes,
+            "native_prefixes": self.native_prefixes,
+            "sent": self.sent,
+            "positive_count": self.positive_count,
+        }
+
     def restore(self, state):
+        if state.get("native"):
+            self.queue = state["queue"]
+            self.seen = state["seen"]
+            self.nodes = state["nodes"]
+            self.native_prefixes = state["native_prefixes"]
+            self.sent = state["sent"]
+            self.positive_count = state["positive_count"]
+            return
         self.queue = deque(ipaddress.ip_network(p) for p in state["queue"])
         self.seen = {ipaddress.ip_network(p) for p in state["seen"]}
         self.nodes = {

@@ -9,7 +9,7 @@ the following streaming contract:
 - `feed_aggregate(node, mode, probes, positives, replies, sources)` — commit
   one batch aggregate for a node/action class.
 - `finish_batch()` — finalise the round (re-arm the frontier, bump the epoch).
-- `snapshot()` / `restore(state)` — compact node-aggregate state for resume.
+- `checkpoint()` / `restore(state)` — compact node-aggregate state for resume; `snapshot()` remains for legacy JSON checkpoints.
 
 `scripts/run_formal.py` turns streamed targets into a manifest and temporary
 `sent-targets.txt`, then runs ZMap and the streaming formal parser. The scanner consumes only `sent-targets.txt`; it need not know which

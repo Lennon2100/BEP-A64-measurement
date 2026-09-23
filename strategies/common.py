@@ -145,9 +145,25 @@ class Targets:
             "recovery_batches": self.recovery_batches,
         }
 
+    def checkpoint(self):
+        """Return live compact state without copying the cursor table."""
+        return {
+            "native": True,
+            "seed": self.seed,
+            "rng": self.rng.getstate(),
+            "positions": self.positions,
+            "recovery_batches": self.recovery_batches,
+        }
+
     def restore(self, state):
         if state["seed"] != self.seed:
             raise ValueError("target generator seed mismatch")
+        if state.get("native"):
+            self.rng.setstate(state["rng"])
+            self.positions = state["positions"]
+            self.recovered = array("Q")
+            self.recovery_batches = state.get("recovery_batches", [])
+            return
         def tuples(value):
             return tuple(tuples(item) for item in value) if isinstance(value, list) else value
 

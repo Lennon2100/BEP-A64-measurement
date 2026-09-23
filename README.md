@@ -101,14 +101,16 @@ command and version, raw ZMap CSV, compact parsed per-probe evidence, node
 feedback, matched AU router observations, and the post-batch checkpoint. The temporary `.work`
 directory is removed only after the archive has been written and read back.
 Compression temporarily needs space for both the working batch and its
-archive. A `.tar.gz.part` or a `.work` directory without complete raw scan
-evidence blocks automatic resume and requires manual inspection.
+archive. A `.tar.gz.part` blocks automatic resume. A `.work` directory with
+scan artifacts but incomplete evidence requires manual inspection; a directory
+containing only the generated manifest and target list is discarded and
+regenerated because the scanner was never entered.
 
 If scanning completed and only formal parsing failed, keep the next `.work`
 directory and run with `--resume`. For a legacy `.work` without a prepared
 checkpoint, the runner adopts its already-sent manifest, excludes those `/64`s
 from future targets, then parses and archives the existing raw CSV without
-invoking ZMap again. New batches save `prepared-state.json` before scanning, so
+invoking ZMap again. New batches save `prepared-state.pkl.gz` before scanning, so
 later parser failures restore the exact post-generation state. Formal parsing
 charges one target once even when it produced several response classes: any
 matched IMC-positive response makes it positive, raw CSV retains every reply,
@@ -118,7 +120,7 @@ The legacy adoption keeps one sorted batch-sized exclusion index in memory and
 reconstructs it from that batch archive on restart. New completed batches do
 not enlarge this exceptional index.
 
-Resume reads the newest archive's `state.json` (per-node aggregates and
+Resume reads an old archive's `state.json` or a new archive's `state.pkl.gz` (per-node aggregates and
 deterministic generator cursors). It does **not** replay completed archives or
 load an accumulated probe set; startup and resident strategy state are
 O(active nodes). The configuration must match the recorded `formal.json`.

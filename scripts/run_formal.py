@@ -5,7 +5,7 @@ Each feedback round is one ZMap invocation (fixed target list plus one receive
 tail), so the strategy feedback batch and the scanner file batch are the same
 thing; the configurable `batch_size` sets that round.  Targets are generated
 and written to disk as a stream, never materialised as full per-target lists.
-Every successful archive contains the compact post-batch `state.json`; resume
+Every successful archive contains the compact post-batch `state.pkl.gz`; resume
 loads that checkpoint without replaying historical probe rows.
 """
 
@@ -17,6 +17,7 @@ import io
 import ipaddress
 import json
 import os
+import pickle
 import shutil
 import signal
 import subprocess
@@ -26,6 +27,11 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # Windows development host; formal runs use Linux.
+    resource = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from strategies.common import Targets
@@ -42,8 +48,8 @@ ARCHIVE_FILES = (
     "probes.csv.summary.json",
     "feedback.csv",
     "last-hop-router-observations.csv",
-    "state.json",
 )
+CHECKPOINT_NAME = "state.pkl.gz"
 
 
 @dataclass
@@ -71,22 +77,52 @@ def allowance_for(cfg):
 
 def write_json_atomic(path, payload):
     tmp = path.with_name(path.name + ".part")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write("\n")
     os.replace(tmp, path)
 
 
+def write_checkpoint_atomic(path, payload):
+    tmp = path.with_name(path.name + ".part")
+    with gzip.open(tmp, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+
+
+def read_checkpoint_file(path):
+    with gzip.open(path, "rb") as fh:
+        return pickle.load(fh)
+
+
+def checkpoint_payload(context, batch_number):
+    return {
+        "strategy": context.strategy.checkpoint(),
+        "targets": context.targets.checkpoint(),
+        "batch_number": batch_number,
+        "stages": dict(context.stages),
+    }
+
+
+def log_memory(stage):
+    if resource is not None:
+        peak_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        print(f"memory {stage}: peak_rss={peak_mib:.1f} MiB", file=sys.stderr, flush=True)
+
+
 def archive_batch(folder, archive):
-    missing = [name for name in ARCHIVE_FILES if not (folder / name).is_file()]
+    archive_files = ARCHIVE_FILES + (CHECKPOINT_NAME,)
+    missing = [name for name in archive_files if not (folder / name).is_file()]
     if missing:
         raise ValueError(f"batch is incomplete, refusing to archive: {missing}")
     temporary = archive.with_name(archive.name + ".part")
     if temporary.exists() or archive.exists():
         raise FileExistsError(f"batch archive already exists: {archive}")
     with tarfile.open(temporary, "w:gz") as bundle:
-        for name in ARCHIVE_FILES:
+        for name in archive_files:
             bundle.add(folder / name, arcname=name)
     with tarfile.open(temporary, "r:gz") as bundle:
-        if set(bundle.getnames()) != set(ARCHIVE_FILES):
+        if set(bundle.getnames()) != set(archive_files):
             raise ValueError(f"batch archive is incomplete: {temporary}")
         for member in bundle:
             with bundle.extractfile(member) as fh:
@@ -103,6 +139,11 @@ def load_checkpoint(archives):
     if not archives:
         raise ValueError("formal run has no committed batch to resume")
     with tarfile.open(archives[-1], "r:gz") as bundle:
+        names = set(bundle.getnames())
+        if CHECKPOINT_NAME in names:
+            with bundle.extractfile(CHECKPOINT_NAME) as raw:
+                with gzip.GzipFile(fileobj=raw) as fh:
+                    return pickle.load(fh)
         with bundle.extractfile("state.json") as fh:
             return json.load(io.TextIOWrapper(fh, encoding="utf-8"))
 
@@ -154,15 +195,13 @@ def finish_scanned_batch(folder, archive, batch_number, context):
         if rebuild is not None:
             rebuild()
         context.legacy_recovery = False
-    checkpoint = {
-        "strategy": context.strategy.snapshot(), "targets": context.targets.snapshot(),
-        "last_hop_routers": sorted(context.routers),
-        "batch_number": batch_number, "stages": dict(context.stages),
-    }
-    write_json_atomic(folder / "state.json", checkpoint)
+    checkpoint = checkpoint_payload(context, batch_number)
+    checkpoint["last_hop_routers"] = context.routers
+    write_checkpoint_atomic(folder / CHECKPOINT_NAME, checkpoint)
     (folder / "sent-targets.txt").unlink(missing_ok=True)
     archive_batch(folder, archive)
-    write_json_atomic(archive.parent / "state.json", checkpoint)
+    write_checkpoint_atomic(archive.parent / CHECKPOINT_NAME, checkpoint)
+    log_memory(f"after batch {batch_number}")
 
 
 def adopt_scanned_manifest(folder, batch_number, context):
@@ -239,12 +278,28 @@ def run_method(config_path, method, resume=False):
             load_recovered_targets(output, targets)
             last_hop_routers.update(state["last_hop_routers"])
             stage_counts.update(state["stages"])
+            del state
+            log_memory("after restoring committed checkpoint")
 
-        work = list(output.glob("batch-*.work"))
+        work = sorted(output.glob("batch-*.work"))
         if work:
             expected_work = output / f"batch-{batch_number + 1:09d}.work"
             if work != [expected_work]:
                 raise ValueError("expected exactly the next unfinished batch work directory")
+            scan_artifacts = ("raw-zmap.csv", "scan.log", "scan-complete")
+            if (
+                (expected_work / "manifest.csv").is_file()
+                and (expected_work / "sent-targets.txt").is_file()
+                and not any((expected_work / name).exists() for name in scan_artifacts)
+            ):
+                print(
+                    f"discarding unscanned {expected_work.name} after interrupted checkpoint",
+                    file=sys.stderr, flush=True,
+                )
+                shutil.rmtree(expected_work)
+                work = []
+        if work:
+            expected_work = work[0]
             required = ("manifest.csv", "raw-zmap.csv", "scan.log")
             if any(not (expected_work / name).is_file() for name in required):
                 raise ValueError("unfinished batch has no complete scan evidence; inspect it manually")
@@ -252,14 +307,20 @@ def run_method(config_path, method, resume=False):
             legacy_parser_started = (expected_work / "probes.csv").is_file()
             if not scan_completed and not legacy_parser_started:
                 raise ValueError("unfinished batch has no completed-scan marker; inspect it manually")
-            prepared_path = expected_work / "prepared-state.json"
-            if prepared_path.is_file():
-                prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
+            prepared_path = expected_work / "prepared-state.pkl.gz"
+            legacy_prepared_path = expected_work / "prepared-state.json"
+            if prepared_path.is_file() or legacy_prepared_path.is_file():
+                prepared = (
+                    read_checkpoint_file(prepared_path)
+                    if prepared_path.is_file()
+                    else json.loads(legacy_prepared_path.read_text(encoding="utf-8"))
+                )
                 strategy.restore(prepared["strategy"])
                 targets.restore(prepared["targets"])
                 load_recovered_targets(output, targets)
                 stage_counts.clear()
                 stage_counts.update(prepared["stages"])
+                del prepared
             else:
                 print(f"adopting already-sent {expected_work.name}", file=sys.stderr, flush=True)
                 adopt_scanned_manifest(expected_work, batch_number + 1, batch_context)
@@ -304,17 +365,19 @@ def run_method(config_path, method, resume=False):
                 stage_counts[mode] += 1
                 count += 1
 
+        log_memory(f"after generating batch {batch_number}")
+
         if count == 0:
             # Candidates exhausted; nothing was sent, so drop the empty batch.
             shutil.rmtree(folder)
             batch_number -= 1
             break
 
-        write_json_atomic(folder / "prepared-state.json", {
-            "strategy": strategy.snapshot(),
-            "targets": targets.snapshot(),
-            "stages": dict(stage_counts),
-        })
+        write_checkpoint_atomic(
+            folder / "prepared-state.pkl.gz",
+            checkpoint_payload(batch_context, batch_number),
+        )
+        log_memory(f"after checkpointing batch {batch_number}")
 
         command = [
             "bash", str(run_scan), str(zmap), str(sent), str(raw),

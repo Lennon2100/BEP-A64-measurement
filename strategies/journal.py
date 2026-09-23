@@ -326,7 +326,32 @@ class Strategy:
             "touched": [str(node) for node in self._touched],
         }
 
+    def checkpoint(self):
+        """Return live node state for bounded-overhead checkpoint serialization."""
+        return {
+            "native": True,
+            "nodes": self.nodes,
+            "sent": self.sent,
+            "positive_count": self.positive_count,
+            "root_index": self.root_index,
+            "epoch": self.epoch,
+            "heap": self.heap,
+            "seq": self.seq,
+            "touched": self._touched,
+        }
+
     def restore(self, state):
+        if state.get("native"):
+            self.nodes = state["nodes"]
+            self.sent = state["sent"]
+            self.positive_count = state["positive_count"]
+            self.root_index = state["root_index"]
+            self.epoch = state["epoch"]
+            self.heap = state["heap"]
+            self.seq = state["seq"]
+            self._touched = state["touched"]
+            self.cache = {}
+            return
         self.nodes = {
             ipaddress.ip_network(p): {
                 "parent": ipaddress.ip_network(rec["parent"]) if rec["parent"] else None,
