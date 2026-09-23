@@ -28,7 +28,11 @@ CLASS_BITS = {
     "direct": 1,
     "slow_au": 2,
     "fast_au": 4,
-    "other_error": 8,
+    "nr": 8,
+    "ap": 16,
+    "rr": 32,
+    "tx": 64,
+    "other_error": 128,
 }
 REPLY_CLASSES = {"direct", "slow_au", "fast_au"}
 
