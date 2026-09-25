@@ -61,6 +61,7 @@ class BatchContext:
     routers: set
     stages: Counter
     legacy_recovery: bool = False
+    started_utc: str | None = None
 
 
 def absolute(base, value):
@@ -101,6 +102,7 @@ def checkpoint_payload(context, batch_number):
         "targets": context.targets.checkpoint(),
         "batch_number": batch_number,
         "stages": dict(context.stages),
+        "started_utc": context.started_utc,
     }
 
 
@@ -295,6 +297,7 @@ def run_method(config_path, method, resume=False):
                 for router in state["last_hop_routers"]
             )
             stage_counts.update(state["stages"])
+            batch_context.started_utc = state.get("started_utc")
             del state
             log_memory("after restoring committed checkpoint")
 
@@ -337,6 +340,7 @@ def run_method(config_path, method, resume=False):
                 load_recovered_targets(output, targets)
                 stage_counts.clear()
                 stage_counts.update(prepared["stages"])
+                batch_context.started_utc = prepared.get("started_utc", batch_context.started_utc)
                 del prepared
             else:
                 print(f"adopting already-sent {expected_work.name}", file=sys.stderr, flush=True)
@@ -350,6 +354,7 @@ def run_method(config_path, method, resume=False):
     else:
         output.mkdir(parents=True)
         shutil.copyfile(config_path, output / "formal.json")
+        batch_context.started_utc = datetime.now(timezone.utc).isoformat()
 
     while strategy.sent < allowance:
         if STOP_REQUESTED:
@@ -417,10 +422,18 @@ def run_method(config_path, method, resume=False):
             fh.writelines(str(prefix) + "\n" for prefix in native)
     with gzip.open(output / "last-hop-routers.txt.gz", "wt", encoding="utf-8") as fh:
         fh.writelines(str(ipaddress.IPv6Address(router)) + "\n" for router in sorted(last_hop_routers))
+    finished_utc = datetime.now(timezone.utc)
+    runtime_seconds = None
+    if batch_context.started_utc:
+        runtime_seconds = (
+            finished_utc - datetime.fromisoformat(batch_context.started_utc)
+        ).total_seconds()
     summary = {
         "method": method,
         "started_from": "RIS BGP only",
-        "finished_utc": datetime.now(timezone.utc).isoformat(),
+        "started_utc": batch_context.started_utc,
+        "finished_utc": finished_utc.isoformat(),
+        "runtime_seconds": runtime_seconds,
         "budget_total": allowance,
         "formal_sent": strategy.sent,
         "budget_exhausted": strategy.sent == allowance,

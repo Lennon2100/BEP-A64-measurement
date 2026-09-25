@@ -43,6 +43,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("formal_config")
     parser.add_argument("--curve-interval", type=int, default=10000)
+    parser.add_argument("--methods", help="comma-separated methods to analyze (default: all in config)")
     args = parser.parse_args()
     if args.curve_interval <= 0:
         parser.error("--curve-interval must be positive")
@@ -52,8 +53,16 @@ def main():
     if not root.is_absolute():
         root = config_path.parent / root
 
+    methods = list(config["strategies"])
+    if args.methods:
+        requested = [m.strip() for m in args.methods.split(",") if m.strip()]
+        missing = [m for m in requested if m not in methods]
+        if missing:
+            parser.error(f"methods not in config strategies: {missing}")
+        methods = requested
+
     summaries = []
-    for method in config["strategies"]:
+    for method in methods:
         summaries.append(json.loads((root / method / "summary.json").read_text(encoding="utf-8")))
 
     comparison_path = root / "comparison.csv"
