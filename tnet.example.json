@@ -1,0 +1,28 @@
+{
+  "campaign_id": "formal-tnet-budget-charged-v1",
+  "input": {
+    "tnet_prefix_csv": "data/interim/ris_ipv6_prefixes_unique.csv",
+    "frame_exclusions": "config/frame_exclusions.txt"
+  },
+  "seed": "bep-full-tree-formal-v1",
+  "budget_total_per_method": 5000000000,
+  "batch_size": 1000000,
+  "slow_au_threshold_ms": 1000,
+  "scanner": {
+    "zmap_binary": ".build/zmap-build/src/zmap",
+    "source_ipv6": "2607:8700:5500:3959::2",
+    "interface": "ipv6net",
+    "gateway_mac": "-",
+    "rate_pps": 1000,
+    "cooldown_seconds": 30
+  },
+  "strategies": {
+    "tnet": {
+      "candidate_screen_budget": 4500000000,
+      "rounds": 10,
+      "top_k_ratio": 0.04,
+      "initial_temperature": 1.0
+    }
+  },
+  "output_root": "runs/formal-tnet-budget-charged-v1"
+}

@@ -1,0 +1,28 @@
+{
+  "campaign_id": "formal-bep-conference-v1",
+  "input": {
+    "bep_conference_prefix_csv": "data/interim/ris_ipv6_prefixes_unique.csv",
+    "frame_exclusions": "config/frame_exclusions.txt"
+  },
+  "seed": "bep-conference-formal-v1",
+  "budget_total_per_method": 5000000000,
+  "batch_size": 1000000,
+  "slow_au_threshold_ms": 1000,
+  "scanner": {
+    "zmap_binary": ".build/zmap-build/src/zmap",
+    "source_ipv6": "2607:8700:5500:3959::2",
+    "interface": "ipv6net",
+    "gateway_mac": "-",
+    "rate_pps": 1000,
+    "cooldown_seconds": 30
+  },
+  "strategies": {
+    "bep_conference": {
+      "prior_decay": 0.5,
+      "minimum_strength": 2.0,
+      "credible_z": 1.96,
+      "expansion_cost": 1.0
+    }
+  },
+  "output_root": "runs/formal-bep-conference-v1"
+}

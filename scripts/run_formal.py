@@ -176,10 +176,18 @@ def parse_scanned_batch(folder, context):
 
 def apply_batch_feedback(folder, context):
     router_obs = folder / "last-hop-router-observations.csv"
+    feed_router = getattr(context.strategy, "feed_router_observation", None)
     with open(router_obs, newline="", encoding="utf-8") as fh:
-        context.routers.update(row["router_ipv6"] for row in csv.DictReader(fh))
+        for row in csv.DictReader(fh):
+            router = int(ipaddress.IPv6Address(row["router_ipv6"]))
+            context.routers.add(router)
+            if feed_router is not None:
+                feed_router(row["c64"], router)
+    feed_class = getattr(context.strategy, "feed_class_aggregate", None)
     with open(folder / "feedback.csv", newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
+            if feed_class is not None:
+                feed_class(row)
             context.strategy.feed_aggregate(
                 row["node"], row["mode"], int(row["probes"]),
                 int(row["positives"]), int(row["replies"]), json.loads(row["sources"]),
@@ -248,6 +256,12 @@ def run_method(config_path, method, resume=False):
     frame = strategy_module.load_frame(cfg, base)
     targets = Targets(f"{cfg['seed']}:{method}")
     strategy = strategy_module.Strategy(frame, targets, cfg["strategies"][method], allowance)
+    minimum_batch_size = getattr(strategy, "minimum_batch_size", 1)
+    if int(cfg["batch_size"]) < minimum_batch_size:
+        raise ValueError(
+            f"{method} requires batch_size >= {minimum_batch_size} "
+            "to keep one strategy action intact"
+        )
 
     scanner = cfg["scanner"]
     zmap = absolute(base, scanner["zmap_binary"])
@@ -276,7 +290,10 @@ def run_method(config_path, method, resume=False):
             strategy.restore(state["strategy"])
             targets.restore(state["targets"])
             load_recovered_targets(output, targets)
-            last_hop_routers.update(state["last_hop_routers"])
+            last_hop_routers.update(
+                int(ipaddress.IPv6Address(router))
+                for router in state["last_hop_routers"]
+            )
             stage_counts.update(state["stages"])
             del state
             log_memory("after restoring committed checkpoint")
@@ -399,7 +416,7 @@ def run_method(config_path, method, resume=False):
         with gzip.open(output / "native-prefixes.txt.gz", "wt", encoding="utf-8") as fh:
             fh.writelines(str(prefix) + "\n" for prefix in native)
     with gzip.open(output / "last-hop-routers.txt.gz", "wt", encoding="utf-8") as fh:
-        fh.writelines(router + "\n" for router in sorted(last_hop_routers, key=ipaddress.IPv6Address))
+        fh.writelines(str(ipaddress.IPv6Address(router)) + "\n" for router in sorted(last_hop_routers))
     summary = {
         "method": method,
         "started_from": "RIS BGP only",
@@ -412,6 +429,8 @@ def run_method(config_path, method, resume=False):
         "stages": dict(stage_counts),
         "native_prefix_count": len(native),
     }
+    if hasattr(strategy, "native_positive_count"):
+        summary["native_observed_positive_c64"] = strategy.native_positive_count
     write_json_atomic(output / "summary.json", summary)
     return summary
 

@@ -34,16 +34,25 @@ class Frame:
     """Immutable routed BGP frame: prefixes, non-overlapping roots, tree features."""
 
     def __init__(self, prefixes, parents):
+        self.prefix_set = set(prefixes)
+        self.children = defaultdict(list)
+        for child, parent in parents.items():
+            self.children[parent].append(child)
+        for children in self.children.values():
+            children.sort(key=lambda p: (p.prefixlen, int(p.network_address)))
         self.prefixes = sorted(prefixes, key=lambda p: (int(p.network_address), p.prefixlen))
         self.roots = sorted(set(prefixes) - set(parents), key=lambda p: int(p.network_address))
         self.prefixes_by_root = defaultdict(list)
         self.descendants = {prefix: 0 for prefix in prefixes}
+        self.deepest = {prefix: prefix.prefixlen for prefix in prefixes}
         root_cache = {}
         for prefix in prefixes:
             self.prefixes_by_root[root_for(prefix, parents, root_cache)].append(prefix)
         for prefix in sorted(prefixes, key=lambda p: p.prefixlen, reverse=True):
             if prefix in parents:
-                self.descendants[parents[prefix]] += 1 + self.descendants[prefix]
+                parent = parents[prefix]
+                self.descendants[parent] += 1 + self.descendants[prefix]
+                self.deepest[parent] = max(self.deepest[parent], self.deepest[prefix])
 
     @classmethod
     def journal(cls, prefix_csv, frame_exclusions):

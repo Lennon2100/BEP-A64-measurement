@@ -22,7 +22,10 @@ ROUTER_FIELDS = [
     "probe_id", "c64", "target_ipv6", "router_ipv6", "response_class",
     "rtt_ms", "raw_row_number",
 ]
-FEEDBACK_FIELDS = ["node", "mode", "probes", "positives", "replies", "sources"]
+FEEDBACK_FIELDS = [
+    "node", "mode", "probes", "positives", "replies", "sources",
+    "bep_active", "bep_inactive", "bep_null",
+]
 
 CLASS_BITS = {
     "direct": 1,
@@ -119,7 +122,10 @@ def main(argv=None):
 
     try:
         responses, raw_count, invalid_count = load_raw(args.raw, args.slow_au_threshold_ms)
-        feedback = defaultdict(lambda: {"probes": 0, "positives": 0, "replies": 0, "sources": set()})
+        feedback = defaultdict(lambda: {
+            "probes": 0, "positives": 0, "replies": 0, "sources": set(),
+            "bep_active": 0, "bep_inactive": 0, "bep_null": 0,
+        })
         statuses = Counter()
         classes = Counter()
         planned = positives = multi = cross_class = 0
@@ -157,10 +163,25 @@ def main(argv=None):
                 aggregate["probes"] += 1
                 aggregate["positives"] += positive
                 aggregate["replies"] += bool(found and found.reply)
+                if found and found.class_mask & CLASS_BITS["slow_au"]:
+                    aggregate["bep_active"] += 1
+                elif found and found.class_mask & (
+                    CLASS_BITS["fast_au"] | CLASS_BITS["tx"] | CLASS_BITS["rr"]
+                ):
+                    aggregate["bep_inactive"] += 1
+                else:
+                    aggregate["bep_null"] += 1
                 for router, observation in (found.au_sources or {}).items() if found else ():
                     router_text = str(ipaddress.IPv6Address(router))
                     router_rtt, router_class, router_line = observation
-                    aggregate["sources"].add(router_text)
+                    # TNet consumes candidate-screen router evidence from the
+                    # streamed observation file. Avoid duplicating millions of
+                    # one-shot router values in its node feedback aggregate.
+                    if (
+                        row["mode"] != "candidate_screen"
+                        and not row["mode"].startswith("conference_")
+                    ):
+                        aggregate["sources"].add(router_text)
                     router_writer.writerow({
                         "probe_id": row["probe_id"], "c64": row["c64"],
                         "target_ipv6": target, "router_ipv6": router_text,
@@ -189,6 +210,9 @@ def main(argv=None):
                     "node": node, "mode": mode, "probes": item["probes"],
                     "positives": item["positives"], "replies": item["replies"],
                     "sources": json.dumps(sorted(item["sources"])),
+                    "bep_active": item["bep_active"],
+                    "bep_inactive": item["bep_inactive"],
+                    "bep_null": item["bep_null"],
                 })
         summary = {
             "planned_probe_count": planned, "raw_response_count": raw_count,

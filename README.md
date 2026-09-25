@@ -12,10 +12,10 @@ strategy implementation -> ordered target file -> run_scan.sh -> raw ZMap CSV
 ```
 
 Each search strategy or adapted comparator remains a separate target producer.
-The scanner need not know which method produced a target. The journal strategy
-reads the full unique RIS prefix CSV; the BGP-only ICNP SubRecon adaptation
-reads the separate top-level-prefix CSV. Neither receives historical response labels
-or an external Hitlist. `scripts/run_formal.py` runs one method through this boundary;
+The scanner need not know which method produced a target. The journal and TNet
+strategies read the full unique RIS prefix CSV; the BGP-only ICNP SubRecon
+adaptation reads the separate top-level-prefix CSV. None receives historical
+response labels or an external Hitlist. `scripts/run_formal.py` runs one method through this boundary;
 `campaign.json` remains the completed fixed-panel D050 configuration.
 
 ## Included now
@@ -43,9 +43,10 @@ or an external Hitlist. `scripts/run_formal.py` runs one method through this bou
   Formal runs also request matched Type 1 Code 3 AU source addresses before
   same-class multi-response folding.
 - `strategies/README.md`: the minimal target-producer contract.
-- `strategies/journal.py` and `strategies/subrecon.py`: the implemented
-  formal search policies. TNet remains pending because its unpublished code
-  and unspecified numerical policy do not determine a unique reproduction.
+- `strategies/journal.py`, `strategies/bep_conference.py`,
+  `strategies/subrecon.py`, and `strategies/tnet.py`: the implemented formal
+  search policies. TNet is a paper-description adaptation because its
+  implementation is not public.
 - `scripts/run_formal.py`: the formal scan/parse loop with streaming target
   generation and compact cursor/node checkpoints (no archive replay).
 - `scripts/analyze_formal.py`: derives per-method cost/discovery curves from
@@ -58,10 +59,11 @@ discovery curves on demand; it does not combine them into a paper figure.
 ## Formal journal and SubRecon run
 
 Copy `formal.example.json` to a new configuration on the Linux measurement
-host. It records a 5B ceiling for each method and `theta_b=1`, whose root
-base quotas fit inside the configured half-budget root allocation by
-response-blind arithmetic. Confirm the
-source address, interface, finite packet rate, and output directory before
+host. It records a 5B ceiling for each method and `theta_b=16`, matching the
+conference HD-Ratio scale while applying it to every activated actual length.
+At startup, the strategy sums every root's response-independent base quota and
+refuses to run if `root_budget_fraction` cannot fund all roots. Confirm the
+source address, interface, finite packet rate, budget, and output directory before
 sending probes. The input paths in the example match
 `MEASUREMENT_RUNBOOK.md`: the journal method loads
 `data/interim/ris_ipv6_prefixes_unique.csv`, and SubRecon loads
@@ -94,6 +96,49 @@ is compressed, and the runner exits with `status: paused`. Continue it with:
 sudo python3 scripts/run_formal.py formal.json journal --resume
 sudo python3 scripts/run_formal.py formal.json subrecon --resume
 ```
+
+## TNet run
+
+`tnet.example.json` is a separate configuration so existing journal and
+SubRecon checkpoints remain reproducible. Its 5B method budget charges both
+TNet stages: 4.5B probes for a uniform sample without replacement from the
+routed `/48` union, followed by the paper's 500M-probe, ten-round search. The
+screen keeps only `/48` regions whose observed AU source is unique, then uses
+Top-K=0.04 Boltzmann allocation at `/48` and hit-rate allocation at `/52`.
+The paper screened all roughly 15B routed `/48`s, so the 4.5B screen is an
+explicit budget-constrained adaptation.
+
+```bash
+cp tnet.example.json tnet.json
+# Set the real source IPv6, interface, gateway mode, rate, and output path.
+sudo python3 scripts/run_formal.py tnet.json tnet
+sudo python3 scripts/run_formal.py tnet.json tnet --resume
+python3 scripts/analyze_formal.py tnet.json
+```
+
+## Conference BEP run
+
+`bep_conference.example.json` runs the original fixed five-level strategy as a
+separate method. It normalizes the routed RIS union to unique `/32` roots,
+traverses `/32 → /40 → /48 → /56 → /64`, and uses the paper's Table I quotas
+`1024, 256, 64, 16, 1`. Slow AU responses update the native Beta likelihood as
+positive; fast AU, TX, and RR update it as negative; null observations are
+excluded. The common comparison metric still counts Echo Reply or slow AU.
+Its `summary.json` additionally reports `native_observed_positive_c64`, the
+number of unique probes classified as slow AU by the conference likelihood.
+
+```bash
+cp bep_conference.example.json bep-conference.json
+# Set the real source IPv6, interface, gateway mode, rate, and output path.
+sudo python3 scripts/run_formal.py bep-conference.json bep_conference
+sudo python3 scripts/run_formal.py bep-conference.json bep_conference --resume
+python3 scripts/analyze_formal.py bep-conference.json
+```
+
+The paper defines expansion cost `c` but does not report a separate numerical
+setting. The example records the normalized choice `expansion_cost=1.0`, making
+the implemented threshold `1 / 2^(64-prefix_length)`. Use a new campaign and
+output directory if this explicit interpretation changes.
 
 Each completed batch is one `batch-000000001.tar.gz` archive containing a
 single `manifest.csv` (the ordered target table plus `node`/`mode`), scanner
@@ -139,12 +184,11 @@ is omitted. When present, native comparator prefixes are written to
 `analyze_formal.py` derives `comparison.csv` and `cost-discovery-curve.csv.gz`
 from each batch's `probes.csv`.
 
-To add TNet later, add `strategies/tnet.py` with `load_frame(config, base)`,
-`Strategy.iter_targets(limit)`, `Strategy.feed_aggregate(...)`,
-`Strategy.finish_batch()`, and `snapshot()/restore()`, then add its parameters
-under `strategies.tnet` in the configuration. The runner and analyzer select
-configured strategy names; TNet's `/48` screen probes must be reported as a
-charged stage by that strategy.
+TNet reports `candidate_screen`, `uniform`, and `adaptive` stages. Every target
+in all three stages is emitted through the same runner and charged once against
+the same method budget. Candidate-screen AU evidence is streamed from the
+last-hop observation file instead of being duplicated in the node feedback
+CSV.
 
 ## Linux build
 

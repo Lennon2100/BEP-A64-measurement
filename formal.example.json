@@ -1,5 +1,5 @@
 {
-  "campaign_id": "formal-journal-subrecon-5b-v1",
+  "campaign_id": "formal-journal-subrecon-d070-v2",
   "input": {
     "journal_prefix_csv": "data/interim/ris_ipv6_prefixes_unique.csv",
     "subrecon_prefix_csv": "data/interim/ris_ipv6_top_level_prefixes.csv",
@@ -19,9 +19,8 @@
   },
   "strategies": {
     "journal": {
-      "theta_b": 1,
-      "step_bits": [1, 4, 8],
-      "action_block": 8192,
+      "theta_b": 16,
+      "step_bits": [1, 2, 4, 8],
       "prior_strength": 2,
       "prior_decay": 0.85,
       "information_weight": 0.25,
@@ -30,5 +29,5 @@
     },
     "subrecon": {}
   },
-  "output_root": "runs/formal-journal-subrecon-5b-v1"
+  "output_root": "runs/formal-journal-subrecon-d070-v2"
 }
