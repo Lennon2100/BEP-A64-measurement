@@ -13,7 +13,7 @@ import ipaddress
 import os
 import sys
 
-from count_prefix_nesting import build_immediate_parent_map, project_dir
+from prefix_data import build_immediate_parent_map, project_dir
 
 
 def load_rows(path):

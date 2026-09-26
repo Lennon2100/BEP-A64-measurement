@@ -19,8 +19,12 @@ import random
 from array import array
 from collections import defaultdict
 
-from scripts.count_prefix_nesting import build_immediate_parent_map
-from scripts.prepare_campaign import load_exclusions, load_rows, root_for
+from scripts.prefix_data import (
+    build_immediate_parent_map,
+    load_exclusions,
+    load_rows,
+    root_for,
+)
 
 
 def network(text):

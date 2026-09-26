@@ -1,4 +1,0 @@
-# Scan denylist: opt-out and pre-excluded target prefixes.
-# One IPv6 prefix per line; '#' starts a comment. A calibration panel is
-# dropped entirely if any of its six targets falls inside any listed prefix.
-# Add opt-out / exclusion prefixes here before any public run.

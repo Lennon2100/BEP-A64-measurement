@@ -11,8 +11,54 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
-from parse_results import RAW_FIELDS, parse_int, response_class, timing_ms
 from parquet_io import StringParquetWriter, iter_table_file
+
+
+RAW_FIELDS = [
+    "orig-dest-ip", "classification", "success", "type", "code", "saddr",
+    "ttl", "original_ttl", "sent_timestamp_ts", "sent_timestamp_us", "nrsent",
+    "timestamp_str", "timestamp_ts", "timestamp_us",
+]
+
+
+def parse_int(row, field):
+    text = row[field].strip()
+    if not text:
+        raise ValueError(f"empty {field}")
+    return int(text)
+
+
+def timing_ms(row):
+    sent_us = parse_int(row, "sent_timestamp_ts") * 1_000_000 + parse_int(
+        row, "sent_timestamp_us"
+    )
+    recv_us = parse_int(row, "timestamp_ts") * 1_000_000 + parse_int(
+        row, "timestamp_us"
+    )
+    elapsed_us = recv_us - sent_us
+    if elapsed_us < 0:
+        raise ValueError("receive timestamp precedes send timestamp")
+    return elapsed_us / 1000
+
+
+def response_class(icmp_type, icmp_code, rtt_ms, slow_au_threshold_ms):
+    if icmp_type == 129:
+        return "direct", 1
+    if icmp_type == 1:
+        if icmp_code == 3:
+            if rtt_ms >= slow_au_threshold_ms:
+                return "slow_au", 1
+            return "fast_au", 0
+        if icmp_code == 0:
+            return "nr", 0
+        if icmp_code == 1:
+            return "ap", 0
+        if icmp_code == 6:
+            return "rr", 0
+        return "other_error", 0
+    if icmp_type == 3:
+        return "tx", 0
+    return "other_error", 0
 
 
 PROBE_FIELDS = [

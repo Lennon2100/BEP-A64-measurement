@@ -26,6 +26,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 try:
     import resource
@@ -79,6 +80,19 @@ def allowance_for(cfg):
     if not 0 < total <= 100_000_000_000:
         raise ValueError("method budget must be positive and stay within 100B")
     return total
+
+
+def validate_measurement_identity(cfg):
+    identity = cfg["measurement_identity"]
+    notice_url = identity["notice_url"].strip()
+    operator_contact = identity["operator_contact"].strip()
+    parsed = urlparse(notice_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("measurement_identity.notice_url must be a public HTTPS URL")
+    if parsed.hostname in {"example.com", "example.org", "example.net"}:
+        raise ValueError("replace the example measurement notice URL before scanning")
+    if "@" not in operator_contact or operator_contact.endswith("@example.org"):
+        raise ValueError("replace measurement_identity.operator_contact before scanning")
 
 
 def write_json_atomic(path, payload):
@@ -246,6 +260,8 @@ def run_method(config_path, method, resume=False):
     allowance = allowance_for(cfg)
     if int(cfg["batch_size"]) <= 0:
         raise ValueError("batch_size must be positive")
+    if not resume:
+        validate_measurement_identity(cfg)
     output = absolute(base, cfg["output_root"]) / method
     if resume:
         if not output.is_dir():

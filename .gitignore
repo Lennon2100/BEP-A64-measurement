@@ -18,10 +18,5 @@ MEASUREMENT_RUNBOOK.md
 project_memory/
 *blueprint*.md
 
-# Retired local calibration workflow
+# Local experiment configuration
 campaign.json
-scripts/analyze_action_trace.py
-scripts/analyze_campaign.py
-scripts/prepare_action_trace.py
-scripts/run_campaign.py
-tests/fixtures/action_trace_ris.csv

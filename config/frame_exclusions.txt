@@ -1,3 +1,4 @@
+# Add operator opt-outs and local exclusions here, one IPv6 prefix per line.
 # 6to4 transition space. Native IPv6 BGP carries the aggregate toward a
 # relay; it is not an ordinary operator-delegated C64 frame (RFC 3056).
 2002::/16

@@ -1,335 +1,275 @@
 # BEP-A64 IPv6 Measurement Toolkit
 
-This repository contains the Linux measurement code used to compare IPv6 /64
-discovery strategies over BGP-routed address space. It prepares RIPE RIS
-prefixes, generates targets in batches, runs an IPv6-capable ZMap fork, parses
-ICMPv6 responses, saves resumable checkpoints, and produces cost versus
-discovery tables.
+This repository contains the Linux measurement pipeline for comparing IPv6
+`/64` discovery strategies over BGP-routed address space. It prepares RIPE RIS
+prefixes, generates targets, runs an IPv6-capable ZMap fork, classifies ICMPv6
+responses, saves resumable checkpoints, and produces cost-discovery tables.
 
-The code sends real IPv6 packets. Use it only from a host and network where you
-have permission to conduct active measurements. Start with a low packet rate,
-publish contact information for the source address, and maintain an exclusion
-list for opt-out requests.
+## Methods
 
-## Included strategies
-
-| Command name | Description | Starting data |
+| Command | Search strategy | Input |
 | --- | --- | --- |
-| adaptive_bep | BGP-guided, mixed-depth Bayesian search | All unique RIS IPv6 prefixes |
-| bep_conference | Fixed /32, /40, /48, /56, /64 BEP traversal | All unique RIS IPv6 prefixes |
-| subrecon | BGP-only adaptation using SubRecon's published probe table | Top-level RIS IPv6 prefixes |
-| tnet | Reimplementation from the TNet paper description | All unique RIS IPv6 prefixes |
+| `adaptive_bep` | BGP-guided Bayesian search across variable prefix lengths | All unique RIS IPv6 prefixes |
+| `bep_conference` | Fixed `/32`, `/40`, `/48`, `/56`, `/64` BEP traversal | All unique RIS IPv6 prefixes |
+| `subrecon` | SubRecon probe schedule over non-overlapping routed roots | Top-level RIS IPv6 prefixes |
+| `tnet` | TNet workflow reconstructed from the published description | All unique RIS IPv6 prefixes |
 
-The SubRecon implementation does not use an external active-address hitlist.
-TNet had no public implementation available when this repository was prepared,
-so its module is a documented reimplementation rather than a source-level
-reproduction.
-
-All methods share the same scanner, response parser, /64 discovery rule, batch
-archive format, and budget accounting.
-
-## Repository layout
-
-~~~text
-config/                 Prefix exclusions
-patches/                Small compatibility fixes for the scanner
-scripts/                Data preparation, scanning, parsing, and analysis
-strategies/             Independent target-generation strategies
-vendor/                 Unmodified upstream scanner archive
-*.example.json          Example measurement configurations
-~~~
-
-Generated data, build products, run configurations, and scan results are
-ignored by Git.
+Each command runs independently with its own budget, target history, strategy
+state, and output directory. The methods share the scanner, parser, discovery
+rule, archive format, and budget accounting.
 
 ## Requirements
 
-The measurement runner is intended for Linux. Windows is suitable for reading
-and editing the code, but the packet scanner and shell scripts require Linux.
-
-Recommended environment:
-
-- Ubuntu 22.04 or newer
+- Linux measurement host
 - Python 3.10 or newer
-- Memory sized from a representative pilot run
-- A globally routed IPv6 source address
-- Root or the required raw-socket capabilities
-- Enough storage for the uncompressed working batch and its compressed archive
+- Globally routed IPv6 source address
+- Root access or equivalent raw-socket capabilities
+- Storage for one uncompressed batch and its compressed archive
 
-Install the system packages:
+On Ubuntu, install the system packages:
 
-~~~bash
+```bash
 sudo apt-get update
 sudo apt-get install -y \
   build-essential cmake libgmp-dev gengetopt libpcap-dev flex byacc \
-  libjson-c-dev pkg-config libunistring-dev unzip patch \
-  curl gzip bgpdump python3 python3-venv
-~~~
+  libjson-c-dev pkg-config libunistring-dev unzip curl gzip bgpdump \
+  python3 python3-venv
+```
 
-Create a Python environment:
+Create the Python environment:
 
-~~~bash
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 chmod +x scripts/*.sh
-~~~
+```
 
 ## Quick start
 
 ### 1. Build the scanner
 
-The repository includes the upstream scanner archive required by the
-measurement pipeline. The build script verifies that archive and applies the
-four patches under patches/ to the extracted build tree.
-
-~~~bash
+```bash
 ./scripts/build_zmap.sh
-~~~
+```
 
-A successful build prints the ZMap binary path:
+The command extracts and builds the scanner at:
 
-~~~text
+```text
 .build/zmap-build/src/zmap
-~~~
+```
 
-See UPSTREAM_AUDIT.md for the source identity and the reason for each patch.
+The vendored archive comes from
+[`sbaresearch/icmpv6-destination-reachable`](https://github.com/sbaresearch/icmpv6-destination-reachable),
+file `measurements/zmap_versions/aim_zmap_reqnr_single.zip`. The build script
+applies the source edits needed by current CMake toolchains, IPv6 IP-layer
+transmission, and the request-number output field.
 
-### 2. Prepare the BGP input
+### 2. Prepare RIPE RIS prefixes
 
-Download the current RIB from each configured RIPE RIS collector:
+Download the current RIBs:
 
-~~~bash
+```bash
 ./scripts/download_ris.sh data/raw/ris/latest
-~~~
+```
 
-Extract IPv6 prefix and origin-AS rows:
+Extract IPv6 prefixes and origin ASNs:
 
-~~~bash
+```bash
 ./scripts/extract_ris_prefixes.sh \
   data/raw/ris/latest \
   data/interim/ris_ipv6_prefixes.csv
-~~~
+```
 
-Collapse duplicate prefixes while retaining all reported origin ASNs:
+Merge duplicate prefix rows:
 
-~~~bash
+```bash
 ./scripts/dedup_ris_prefixes.sh \
   data/interim/ris_ipv6_prefixes.csv \
   data/interim/ris_ipv6_prefixes_unique.csv
-~~~
+```
 
-Create the non-overlapping top-level prefix file required by SubRecon:
+Create the non-overlapping root file used by SubRecon:
 
-~~~bash
+```bash
 python3 scripts/extract_top_level_prefixes.py \
   data/interim/ris_ipv6_prefixes_unique.csv \
   data/interim/ris_ipv6_top_level_prefixes.csv
-~~~
+```
 
-The two inputs used by the strategies are now:
+Keep the downloaded RIB files and record their collection time with the run.
 
-~~~text
-data/interim/ris_ipv6_prefixes_unique.csv
-data/interim/ris_ipv6_top_level_prefixes.csv
-~~~
+### 3. Configure a run
 
-The download command retrieves moving latest snapshots. Record the collection
-time and keep the downloaded files if the experiment must be reproducible.
-
-### 3. Create a run configuration
-
-For Adaptive BEP and SubRecon:
-
-~~~bash
+```bash
 cp formal.example.json experiment.json
-~~~
+```
 
-For the other methods:
+Edit these fields:
 
-~~~bash
-cp bep_conference.example.json bep-conference.json
-cp tnet.example.json tnet.json
-~~~
-
-Edit the copied file before running it. At minimum, replace:
-
-| Field | Meaning |
+| Field | Purpose |
 | --- | --- |
-| scanner.source_ipv6 | Source IPv6 address assigned to the measurement host |
-| scanner.interface | Outgoing interface |
-| scanner.gateway_mac | IPv6 gateway MAC, or a dash for an IP-layer tunnel |
-| scanner.rate_pps | Global packet rate for this process |
-| scanner.cooldown_seconds | Receive tail after the last transmitted packet |
-| budget_total_per_method | Maximum probes charged to one method |
-| batch_size | Targets sent before the strategy receives feedback |
-| output_root | New directory for this experiment |
-| seed | Run-specific deterministic target seed |
+| `measurement_identity.notice_url` | Public HTTPS page describing the measurement and opt-out process |
+| `measurement_identity.operator_contact` | Monitored operator email address |
+| `scanner.source_ipv6` | IPv6 address assigned to the measurement host |
+| `scanner.interface` | Outgoing interface |
+| `scanner.gateway_mac` | Gateway MAC, or `-` for an IP-layer tunnel |
+| `scanner.rate_pps` | Packet rate |
+| `scanner.cooldown_seconds` | Receive tail after transmission |
+| `budget_total_per_method` | Probe ceiling for each method |
+| `batch_size` | Probes sent before strategy feedback |
+| `output_root` | New run directory |
+| `seed` | Run-specific target seed |
 
-The example IPv6 address and MAC address are documentation values and must be
-replaced. Never reuse an output directory from a different configuration.
+The runner requires a real HTTPS notice URL and operator address before a new
+scan starts. The complete configuration is copied into the run directory.
 
-Check that the JSON is valid:
+Validate the JSON syntax:
 
-~~~bash
+```bash
 python3 -m json.tool experiment.json >/dev/null
-~~~
+```
 
-### 4. Run one strategy
+### 4. Run a method
 
 Adaptive BEP:
 
-~~~bash
+```bash
 sudo .venv/bin/python scripts/run_formal.py experiment.json adaptive_bep
-~~~
+```
 
 SubRecon:
 
-~~~bash
+```bash
 sudo .venv/bin/python scripts/run_formal.py experiment.json subrecon
-~~~
+```
 
-Conference BEP and TNet use their own example configurations:
+Conference BEP and TNet use their own examples:
 
-~~~bash
-sudo .venv/bin/python scripts/run_formal.py \
-  bep-conference.json bep_conference
+```bash
+cp bep_conference.example.json bep-conference.json
+cp tnet.example.json tnet.json
 
+sudo .venv/bin/python scripts/run_formal.py bep-conference.json bep_conference
 sudo .venv/bin/python scripts/run_formal.py tnet.json tnet
-~~~
-
-Each command runs one independent method. Probe budgets and target history are
-not shared between methods.
+```
 
 ### 5. Stop and resume
 
-Send SIGINT or SIGTERM once for a graceful stop. The current scanner batch
-finishes, its evidence and checkpoint are archived, and the runner exits.
+Send `SIGINT` or `SIGTERM` once for a graceful stop. The runner completes the
+current scanner batch, archives its evidence and checkpoint, then exits.
 
-Resume with the same configuration file and method name:
+Resume with the same configuration and method:
 
-~~~bash
+```bash
 sudo .venv/bin/python scripts/run_formal.py \
   experiment.json adaptive_bep --resume
-~~~
+```
 
-The saved configuration must match exactly. A completed run cannot be resumed.
-
-If the process stopped before ZMap started, the next resume discards the
-unscanned work directory and regenerates that batch. If raw scan output exists,
-keep the work directory: resume parses and archives the existing result without
-sending the batch again.
+An interruption before packet transmission leaves an unscanned work directory;
+resume discards it and regenerates the batch. A completed scan is parsed and
+archived without sending the targets again.
 
 ### 6. Analyze completed runs
 
-After every selected method has written summary.json:
-
-~~~bash
+```bash
 .venv/bin/python scripts/analyze_formal.py \
   experiment.json \
   --methods adaptive_bep,subrecon
-~~~
+```
 
-This creates:
+This writes:
 
-- comparison.csv: final cost and discovery totals
-- cost-discovery-curve.csv.gz: cumulative discoveries by probe cost
+- `comparison.csv`: final probe and discovery totals
+- `cost-discovery-curve.csv.gz`: cumulative discoveries by probe cost
 
 Create detailed aggregates for one method:
 
-~~~bash
+```bash
 .venv/bin/python scripts/summarize_formal.py \
   runs/bep-comparison/adaptive_bep
-~~~
+```
 
-The detailed summary includes response composition and budget by prefix length.
+## Discovery rule
 
-## What counts as a discovery
+Each probe selects one address in one `/64`. The parser counts that `/64` as
+observed when the response matches either:
 
-One probe targets one randomly selected address inside one /64. A /64 is
-counted as observed when the parser matches either:
+- an ICMPv6 Echo Reply from the target; or
+- ICMPv6 Destination Unreachable Type 1 Code 3 with round-trip time at least
+  `slow_au_threshold_ms`.
 
-- an ICMPv6 Echo Reply from the target, or
-- an ICMPv6 Address Unreachable response whose measured round-trip time is at
-  least slow_au_threshold_ms.
+The outer source address of a matched Address Unreachable response is saved as
+a last-hop router-interface observation.
 
-The matched outer source address of an Address Unreachable response is retained
-as a candidate last-hop router interface. It is an observed interface address,
-not a verified count of physical routers.
+## Measurement ethics
 
-## Batch files and checkpoints
+Complete these steps before raising the scan rate:
 
-While a batch is running, its files are stored in a directory named
-batch-NNNNNNNNN.work. After parsing succeeds, the runner creates
-batch-NNNNNNNNN.tar.gz, verifies the archive, and removes the work directory.
+1. Obtain written authorization from the measurement host and network operator.
+2. Publish an HTTPS measurement notice with a valid public TLS certificate. It
+   should state the project purpose, source addresses, protocols, schedule,
+   packet rate, contact address, and opt-out procedure.
+3. Point reverse DNS for the source address to the notice domain when the
+   network operator supports it.
+4. Monitor the published contact address throughout the run.
+5. Add opt-out and local exclusion prefixes to `config/frame_exclusions.txt`
+   before starting each method.
+6. Start at a low rate, watch host and network load, and raise the rate in
+   controlled steps.
+7. Stop affected traffic when an operator reports harm or requests exclusion,
+   then update the exclusion file before starting a new run.
+
+The strategy loader applies the exclusion file before target generation. The
+runner prevents repeated `/64` targets within each method and records the
+notice URL and operator contact in the run configuration.
+
+## Output and recovery
+
+The active batch is stored as `batch-NNNNNNNNN.work`. After parsing, the runner
+compresses it to `batch-NNNNNNNNN.tar.gz` and writes a compact checkpoint.
 
 Each archive contains:
 
-- the ordered target manifest
-- the raw ZMap CSV
-- the exact scanner command and scanner version
-- compact per-probe evidence
-- strategy feedback aggregates
-- candidate last-hop router observations
-- the post-batch checkpoint
-- the scanner log
+- ordered target manifest;
+- raw scanner CSV, command, version, and log;
+- per-probe evidence;
+- strategy feedback aggregates;
+- last-hop router-interface observations; and
+- post-batch strategy state.
 
-Tables are stored as Parquet. Raw ZMap output remains CSV. Target generation and
-table writing are streamed so a complete batch is not duplicated in Python
-lists.
+Tables use Parquet and raw scanner output remains CSV. Target generation and
+table writing are streamed. Resume loads the latest checkpoint and does not
+replay all completed probe rows.
 
-The runner refuses to overwrite an existing run or result file.
+At rate `R`, transmitting `B` probes takes approximately `B / R` seconds.
+Cooldown, parsing, compression, and downtime add to the total. Run a small
+authorized pilot to choose a batch size that fits the host's memory and disk.
 
-## Resource planning
+## Repository layout
 
-The configured budget is a ceiling, not an estimate of how long the strategy
-will remain productive.
+```text
+config/                 Prefix exclusions and opt-outs
+scripts/                BGP preparation, scanning, parsing, and analysis
+strategies/             Pluggable target-generation methods
+vendor/                 Scanner source archive
+*.example.json          Example run configurations
+```
 
-At rate R packets per second, transmission time for B probes is approximately:
+Generated data, build products, private configurations, and local research
+notes are excluded through `.gitignore`.
 
-~~~text
-B / R seconds
-~~~
+## Strategy interface
 
-For example, 5 billion probes at 1,000 packets per second require about 57.9
-days of transmission for one method. Batch cooldowns, parsing, compression, and
-downtime add to that duration.
+A strategy module under `strategies/` provides:
 
-Adaptive BEP retains a BGP tree and a mixed-depth search frontier. Large runs
-need more memory than SubRecon even at the same probe count. Monitor resident
-memory and free disk space during pilot runs before selecting a full budget.
+- `load_frame(config, base_directory)`
+- `Strategy.iter_targets(limit)`
+- `Strategy.feed_aggregate(...)`
+- `Strategy.finish_batch()`
+- `Strategy.checkpoint()`
+- `Strategy.restore(state)`
 
-## Adding a strategy
-
-A module under strategies/ provides:
-
-- load_frame(config, base_directory)
-- Strategy.iter_targets(limit)
-- Strategy.feed_aggregate(...)
-- Strategy.finish_batch()
-- Strategy.checkpoint()
-- Strategy.restore(state)
-
-See strategies/README.md for the complete contract. The runner imports the
-module named on the command line, so a new module does not require changes to
-the scanner.
-
-## Scanner provenance
-
-The vendored scanner archive comes from the public
-sbaresearch/icmpv6-destination-reachable artifact and is kept unchanged. Local
-build and IPv6 output fixes are applied as separate patch files. The archive
-identity, embedded revision, output fields, and patch rationale are recorded in
-UPSTREAM_AUDIT.md.
-
-## Known limits
-
-- The scanner build and packet transmission path are Linux-only.
-- TNet is implemented from the paper description because its source was not
-  available.
-- SubRecon uses a BGP-only starting set and therefore omits its external
-  hitlist-driven expansion input.
-- Internet-wide measurements can take days or months at conservative rates.
-- Strategy checkpoints are Python pickle files. Load checkpoints only from a
-  run directory you control.
+The runner imports the module named on the command line. Adding another method
+does not require scanner changes.

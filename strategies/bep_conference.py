@@ -13,7 +13,7 @@ import ipaddress
 import math
 from array import array
 
-from scripts.prepare_campaign import load_exclusions, load_rows
+from scripts.prefix_data import load_exclusions, load_rows
 
 
 LEVELS = (32, 40, 48, 56, 64)
