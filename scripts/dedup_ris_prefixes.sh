@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Collapse a merged multi-collector RIS prefix/origin CSV into one row per
 # unique IPv6 prefix, keeping every distinct origin-AS value as an ordered,
-# "|"-joined list. This implements D040: identical (prefix, origin) rows are
-# duplicate observations, and a prefix announced by several origin ASes still
+# "|"-joined list. Identical (prefix, origin) rows are duplicate observations,
+# and a prefix announced by several origin ASes still
 # contributes its address space exactly once. We never pick a single origin AS
 # and never fabricate one; a blank origin stays blank.
 #

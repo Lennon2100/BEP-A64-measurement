@@ -1,11 +1,11 @@
-"""Task-adapted reproduction of the fixed-level IWQoS BEP strategy.
+"""Fixed-level reproduction of the IWQoS BEP strategy.
 
 The conference method traverses /32, /40, /48, /56, and /64 levels, probes
 each active node according to Table I, and expands all 256 children only when
 the node's 95% posterior lower bound exceeds its depth-dependent threshold.
 Its native likelihood counts slow AU as positive, fast AU/TX/RR as negative,
-and excludes null observations.  Common IMC discoveries are still accounted
-by the formal runner for equal-method comparison.
+and excludes null observations. Common IMC discoveries are still accounted
+by the measurement runner for equal-method comparison.
 """
 
 import bisect

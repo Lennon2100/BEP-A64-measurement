@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream one formal batch into compact probe evidence and node feedback."""
+"""Stream one scan batch into compact probe evidence and strategy feedback."""
 
 import argparse
 import csv

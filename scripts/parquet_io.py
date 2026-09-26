@@ -1,4 +1,4 @@
-"""Chunked Parquet I/O for the formal measurement tables.
+"""Chunked Parquet I/O for measurement tables.
 
 All columns are stored as strings so downstream readers keep the same value
 semantics as the earlier CSV tables.  Writing accumulates rows into bounded

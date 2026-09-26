@@ -1,36 +1,93 @@
-# Strategy boundary
+# Strategy interface
 
-A strategy module implements `load_frame(config, base)` and a `Strategy` with
-the following streaming contract:
+Each measurement method is a Python module in this directory. The runner loads
+the module whose name is passed on the command line.
 
-- `iter_targets(limit)` — a generator yielding `(c64, node, mode)` one target
-  at a time. It decides the batch's `(node, count)` action plan in one frontier
-  pass, then streams targets; it does not commit aggregate state.
-- `feed_aggregate(node, mode, probes, positives, replies, sources)` — commit
-  one batch aggregate for a node/action class.
-- `finish_batch()` — finalise the round (re-arm the frontier, bump the epoch).
-- `checkpoint()` / `restore(state)` — compact node-aggregate state for resume; `snapshot()` remains for legacy JSON checkpoints.
+A module must provide:
 
-`scripts/run_formal.py` turns streamed targets into a manifest and temporary
-`sent-targets.txt`, then runs ZMap and the streaming formal parser. The scanner consumes only `sent-targets.txt`; it need not know which
-method produced the targets. The strategies share packet I/O and the
-parsed response contract without sharing search state. None receives an
-external active seed list; SubRecon uses top-level BGP prefixes and its own
-charged feedback. TNet constructs its candidate `/48` set from charged AU
-router observations before beginning its uniform and adaptive rounds.
+~~~python
+def load_frame(config, base_directory):
+    ...
 
-The conference BEP strategy uses the same contract but consumes the additional
-`bep_active`, `bep_inactive`, and `bep_null` node aggregates. These preserve the
-paper's native likelihood without changing the common IMC discovery count.
+class Strategy:
+    def __init__(self, frame, targets, config, allowance):
+        ...
 
-Every probe is drawn uniformly within exactly one node. Base and adaptive
-node-local samples are recorded separately and both are valid for that node's
-Beta likelihood. Exact deduplication uses deterministic per-node permutation
-cursors and ancestor cursor tests. A split screens each of its at most 256
-sibling partitions once as one complete action before they enter the mixed-depth priority frontier.
-Regions containing deeper or more numerous BGP more-specifics receive a
-bounded priority bonus. State is O(screened nodes), independent of repeated
-probes within those nodes, and never stores one object per historical `/64`.
+    def iter_targets(self, limit):
+        yield c64_integer, node_name, action_name
 
-Additional strategies need only a module and configuration entry; the scan
-loop selects modules by the configured strategy name.
+    def feed_aggregate(
+        self, node_name, action_name, probes, positives, replies, sources
+    ):
+        ...
+
+    def finish_batch(self):
+        ...
+
+    def checkpoint(self):
+        ...
+
+    def restore(self, state):
+        ...
+~~~
+
+## Batch lifecycle
+
+For every batch, the runner:
+
+1. calls iter_targets(limit);
+2. streams the yielded targets to the manifest and ZMap target file;
+3. saves the generated strategy state;
+4. runs ZMap;
+5. parses responses into per-target evidence and per-action aggregates;
+6. calls feed_aggregate() for each action;
+7. calls finish_batch();
+8. saves a resumable checkpoint and archives the batch.
+
+A strategy must not update response-dependent state while yielding targets.
+Feedback becomes available only after the scanner process finishes.
+
+## Target values
+
+c64_integer is the upper 64 bits of an IPv6 address. The shared Targets class
+adds a random 64-bit interface identifier immediately before the target is
+written to the scanner input.
+
+Targets maintains a deterministic permutation cursor for each sampled prefix.
+A strategy can pass ancestor prefixes when drawing from a child so that a /64
+sampled at a broader level is not sent again.
+
+## Feedback fields
+
+The common aggregate contains:
+
+| Field | Meaning |
+| --- | --- |
+| probes | Targets charged to this action |
+| positives | Distinct /64s matching the common discovery rule |
+| replies | Targets with at least one matched response |
+| sources | Distinct matched ICMPv6 source addresses |
+
+Conference BEP also consumes bep_active, bep_inactive, and bep_null counts
+through feed_class_aggregate(). TNet consumes matched last-hop observations
+through feed_router_observation().
+
+## Checkpoints
+
+checkpoint() must return only data required to continue the strategy. The
+runner serializes the result before scanning and again after applying feedback.
+
+Keep checkpoint state proportional to active search nodes. Do not store raw
+responses or one Python object per historical probe; those records already
+exist in the batch archive.
+
+## Included modules
+
+| Module | Purpose |
+| --- | --- |
+| adaptive_bep.py | BGP-guided mixed-depth Bayesian search |
+| bep_conference.py | Fixed five-level BEP reproduction |
+| subrecon.py | BGP-only SubRecon delimitation |
+| tnet.py | TNet paper-description reimplementation |
+| common.py | Prefix loading and deterministic /64 target generation |
+| journal.py | Compatibility import for older configurations |

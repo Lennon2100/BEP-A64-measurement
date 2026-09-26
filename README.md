@@ -1,369 +1,335 @@
-# BEP journal measurement runtime
+# BEP-A64 IPv6 Measurement Toolkit
 
-This directory contains the Linux-side measurement runtime derived from the
-`sbaresearch/icmpv6-destination-reachable` artifact. Development and review can
-happen on Windows, but the bundled ZMap source and the scan wrapper are intended
-to run on Linux.
+This repository contains the Linux measurement code used to compare IPv6 /64
+discovery strategies over BGP-routed address space. It prepares RIPE RIS
+prefixes, generates targets in batches, runs an IPv6-capable ZMap fork, parses
+ICMPv6 responses, saves resumable checkpoints, and produces cost versus
+discovery tables.
 
-The current boundary is intentionally small:
+The code sends real IPv6 packets. Use it only from a host and network where you
+have permission to conduct active measurements. Start with a low packet rate,
+publish contact information for the source address, and maintain an exclusion
+list for opt-out requests.
 
-```text
-strategy implementation -> ordered target file -> run_scan.sh -> raw ZMap CSV
-```
+## Included strategies
 
-Each search strategy or adapted comparator remains a separate target producer.
-The scanner need not know which method produced a target. The journal and TNet
-strategies read the full unique RIS prefix CSV; the BGP-only ICNP SubRecon
-adaptation reads the separate top-level-prefix CSV. None receives historical
-response labels or an external Hitlist. `scripts/run_formal.py` runs one method through this boundary;
-`campaign.json` remains the completed fixed-panel D050 configuration.
+| Command name | Description | Starting data |
+| --- | --- | --- |
+| adaptive_bep | BGP-guided, mixed-depth Bayesian search | All unique RIS IPv6 prefixes |
+| bep_conference | Fixed /32, /40, /48, /56, /64 BEP traversal | All unique RIS IPv6 prefixes |
+| subrecon | BGP-only adaptation using SubRecon's published probe table | Top-level RIS IPv6 prefixes |
+| tnet | Reimplementation from the TNet paper description | All unique RIS IPv6 prefixes |
 
-## Included now
+The SubRecon implementation does not use an external active-address hitlist.
+TNet had no public implementation available when this repository was prepared,
+so its module is a documented reimplementation rather than a source-level
+reproduction.
 
-- `UPSTREAM_AUDIT.md`: source-level reuse audit and known limitations.
-- `vendor/aim_zmap_reqnr_single.zip`: the exact single-instance ZMap archive
-  published inside the paper artifact.
-- `scripts/build_zmap.sh`: verifies and builds that archive on Linux.
-- `scripts/download_ris.sh`: downloads `latest-bview.gz` from every active RIPE
-  RIS collector.
-- `scripts/extract_ris_prefixes.sh`: calls `bgpdump` for every downloaded RIB,
-  drops IPv4, and merges deduplicated IPv6 `prefix,origin_asn` rows.
-- `scripts/dedup_ris_prefixes.sh`: folds the multi-collector output to one row
-  per IPv6 prefix while retaining all reported origins as metadata.
-- `scripts/prepare_campaign.py`: validates the three-column unique-prefix file,
-  builds its immediate-parent BGP tree, and derives the nonoverlapping top-level
-  roots plus response-blind root features; with explicit seeds it also assigns
-  intact roots and emits the first calibration C64/IID panel.
-- `scripts/run_scan.sh`: a strict, non-interactive wrapper around
-  `icmp6_echoscan_time`.
-- `scripts/parse_results.py`: joins one calibration ZMap round to its manifest.
-- `scripts/parse_formal_results.py`: streams a formal manifest while retaining
-  only the current batch's responses and compact node feedback in memory.
-  computes RTT, derives the operational response class, and adds timeout rows.
-  Formal runs also request matched Type 1 Code 3 AU source addresses before
-  same-class multi-response folding.
-- `strategies/README.md`: the minimal target-producer contract.
-- `strategies/journal.py`, `strategies/bep_conference.py`,
-  `strategies/subrecon.py`, and `strategies/tnet.py`: the implemented formal
-  search policies. TNet is a paper-description adaptation because its
-  implementation is not public.
-- `scripts/run_formal.py`: the formal scan/parse loop with streaming target
-  generation and compact cursor/node checkpoints (no archive replay).
-- `scripts/analyze_formal.py`: derives per-method cost/discovery curves from
-  each batch's `probes.parquet`; no separate per-target ledger file is stored.
+All methods share the same scanner, response parser, /64 discovery rule, batch
+archive format, and budget accounting.
 
-`scripts/analyze_campaign.py` already aggregates the D050 reference labels and
-calibration results. The formal runner writes per-method cumulative cost and
-discovery curves on demand; it does not combine them into a paper figure.
+## Repository layout
 
-## Formal journal and SubRecon run
+~~~text
+config/                 Prefix exclusions
+patches/                Small compatibility fixes for the scanner
+scripts/                Data preparation, scanning, parsing, and analysis
+strategies/             Independent target-generation strategies
+vendor/                 Unmodified upstream scanner archive
+*.example.json          Example measurement configurations
+~~~
 
-Copy `formal.example.json` to a new configuration on the Linux measurement
-host. It records a 5B ceiling for each method and `theta_b=16`, matching the
-conference HD-Ratio scale while applying it to every activated actual length.
-At startup, the strategy sums every root's response-independent base quota and
-refuses to run if `root_budget_fraction` cannot fund all roots. Confirm the
-source address, interface, finite packet rate, budget, and output directory before
-sending probes. The input paths in the example match
-`MEASUREMENT_RUNBOOK.md`: the journal method loads
-`data/interim/ris_ipv6_prefixes_unique.csv`, and SubRecon loads
-`data/interim/ris_ipv6_top_level_prefixes.csv`. Both start with zero formal
-probe cost and deduplicate targets within their own run.
+Generated data, build products, run configurations, and scan results are
+ignored by Git.
 
-```bash
-sudo python3 scripts/run_formal.py formal.json journal
-sudo python3 scripts/run_formal.py formal.json subrecon
-python3 scripts/analyze_formal.py formal.json
-```
+## Requirements
 
-**Feasibility.** At `rate_pps = 1000`, one probe costs 1 ms, so 5B probes are
-about 57.9 days of pure transmit time regardless of batching or cooldown; the
-30 s `--cooldown-time` is ZMap's receive tail (needed to capture slow-AU RTTs
-up to ~25 s), not a scheduling sleep. One ZMap invocation accepts one fixed
-target list and then receives for one tail, so the strategy feedback round and
-the scanner file batch are the same thing — there is no mid-scan target
-injection. The only lever is `batch_size`. The template's `batch_size` of
-1,000,000 keeps the tail overhead near 3% while updating the posterior about
-every 17 minutes; the 5B ceiling is therefore a config ceiling, not a promise
-that a single continuous run is practical. Size the first real run to days,
-not months, and raise `rate_pps` only with host/operator authorization.
+The measurement runner is intended for Linux. Windows is suitable for reading
+and editing the code, but the packet scanner and shell scripts require Linux.
 
-Start a method without `--resume` only when its output directory is absent.
-For a graceful stop, send SIGINT or SIGTERM once; the current batch finishes,
-is compressed, and the runner exits with `status: paused`. Continue it with:
+Recommended environment:
 
-```bash
-sudo python3 scripts/run_formal.py formal.json journal --resume
-sudo python3 scripts/run_formal.py formal.json subrecon --resume
-```
+- Ubuntu 22.04 or newer
+- Python 3.10 or newer
+- Memory sized from a representative pilot run
+- A globally routed IPv6 source address
+- Root or the required raw-socket capabilities
+- Enough storage for the uncompressed working batch and its compressed archive
 
-## TNet run
+Install the system packages:
 
-`tnet.example.json` is a separate configuration so existing journal and
-SubRecon checkpoints remain reproducible. Its 5B method budget charges both
-TNet stages: 4.5B probes for a uniform sample without replacement from the
-routed `/48` union, followed by the paper's 500M-probe, ten-round search. The
-screen keeps only `/48` regions whose observed AU source is unique, then uses
-Top-K=0.04 Boltzmann allocation at `/48` and hit-rate allocation at `/52`.
-The paper screened all roughly 15B routed `/48`s, so the 4.5B screen is an
-explicit budget-constrained adaptation.
+~~~bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake libgmp-dev gengetopt libpcap-dev flex byacc \
+  libjson-c-dev pkg-config libunistring-dev unzip patch \
+  curl gzip bgpdump python3 python3-venv
+~~~
 
-```bash
-cp tnet.example.json tnet.json
-# Set the real source IPv6, interface, gateway mode, rate, and output path.
-sudo python3 scripts/run_formal.py tnet.json tnet
-sudo python3 scripts/run_formal.py tnet.json tnet --resume
-python3 scripts/analyze_formal.py tnet.json
-```
+Create a Python environment:
 
-## Conference BEP run
-
-`bep_conference.example.json` runs the original fixed five-level strategy as a
-separate method. It normalizes the routed RIS union to unique `/32` roots,
-traverses `/32 → /40 → /48 → /56 → /64`, and uses the paper's Table I quotas
-`1024, 256, 64, 16, 1`. Slow AU responses update the native Beta likelihood as
-positive; fast AU, TX, and RR update it as negative; null observations are
-excluded. The common comparison metric still counts Echo Reply or slow AU.
-Its `summary.json` additionally reports `native_observed_positive_c64`, the
-number of unique probes classified as slow AU by the conference likelihood.
-
-```bash
-cp bep_conference.example.json bep-conference.json
-# Set the real source IPv6, interface, gateway mode, rate, and output path.
-sudo python3 scripts/run_formal.py bep-conference.json bep_conference
-sudo python3 scripts/run_formal.py bep-conference.json bep_conference --resume
-python3 scripts/analyze_formal.py bep-conference.json
-```
-
-The paper defines expansion cost `c` but does not report a separate numerical
-setting. The example records the normalized choice `expansion_cost=1.0`, making
-the implemented threshold `1 / 2^(64-prefix_length)`. Use a new campaign and
-output directory if this explicit interpretation changes.
-
-Each completed batch is one `batch-000000001.tar.gz` archive containing a
-single `manifest.parquet` (the ordered target table plus `node`/`mode`),
-scanner command and version, raw ZMap CSV, compact parsed per-probe Parquet
-evidence, node feedback, matched AU router observations, and the post-batch
-checkpoint. All derived tables are Parquet (`manifest.parquet`,
-`probes.parquet`, `feedback.parquet`, `last-hop-router-observations.parquet`);
-only ZMap's raw output stays CSV. The temporary `.work`
-directory is removed only after the archive has been written and read back.
-Compression temporarily needs space for both the working batch and its
-archive. A `.tar.gz.part` blocks automatic resume. A `.work` directory with
-scan artifacts but incomplete evidence requires manual inspection; a directory
-containing only the generated manifest and target list is discarded and
-regenerated because the scanner was never entered.
-
-If scanning completed and only formal parsing failed, keep the next `.work`
-directory and run with `--resume`. For a legacy `.work` without a prepared
-checkpoint, the runner adopts its already-sent manifest, excludes those `/64`s
-from future targets, then parses and archives the existing raw CSV without
-invoking ZMap again. New batches save `prepared-state.pkl.gz` before scanning, so
-later parser failures restore the exact post-generation state. Formal parsing
-charges one target once even when it produced several response classes: any
-matched IMC-positive response makes it positive, raw CSV retains every reply,
-and every AU source is retained as last-hop-router evidence.
-
-The legacy adoption keeps one sorted batch-sized exclusion index in memory and
-reconstructs it from that batch archive on restart. New completed batches do
-not enlarge this exceptional index.
-
-Resume reads an old archive's `state.json` or a new archive's `state.pkl.gz` (per-node aggregates and
-deterministic generator cursors). It does **not** replay completed archives or
-load an accumulated probe set; startup and resident strategy state are
-O(active nodes). The configuration must match the recorded `formal.json`.
-
-Each method writes `last-hop-routers.txt.gz` with distinct observed AU source IPv6
-addresses; `summary.json` and `comparison.csv` report that count. These are
-candidate last-hop interface addresses, not verified router identities, and
-they do not change the discovery metric or seed a strategy. Historical probes and
-target lists are not loaded into a formal method.
-
-The conference SubRecon adaptation starts from the top-level BGP prefixes,
-uses `thuname/subrecon`'s `src/budget.c` probe table, and refines using AU
-source diversity and response coverage. Its external Hitlist expansion phase
-is omitted. When present, native comparator prefixes are written to
-`native-prefixes.txt.gz` separately from the common positive `/64` count.
-`analyze_formal.py` derives `comparison.csv` and `cost-discovery-curve.csv.gz`
-from each batch's `probes.parquet`.
-
-TNet reports `candidate_screen`, `uniform`, and `adaptive` stages. Every target
-in all three stages is emitted through the same runner and charged once against
-the same method budget. Candidate-screen AU evidence is streamed from the
-last-hop observation file instead of being duplicated in the node feedback
-CSV.
-
-## Linux build
-
-On Debian/Ubuntu, install the upstream build dependencies plus the Python
-Parquet library used by the formal runner/parser/analyzer:
-
-```bash
-sudo apt-get install build-essential cmake libgmp-dev gengetopt \
-  libpcap-dev flex byacc libjson-c-dev pkg-config libunistring-dev unzip patch
-python3 -m pip install pyarrow
+~~~bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 chmod +x scripts/*.sh
+~~~
+
+## Quick start
+
+### 1. Build the scanner
+
+The repository includes the upstream scanner archive required by the
+measurement pipeline. The build script verifies that archive and applies the
+four patches under patches/ to the extracted build tree.
+
+~~~bash
 ./scripts/build_zmap.sh
-```
+~~~
 
-The script prints the resulting `zmap` path. It does not install system-wide.
-It applies the build, IPv6 SIT, and Echo CSV field-alignment patches under
-`patches/` to the extracted build tree; the vendored ZIP remains unchanged.
+A successful build prints the ZMap binary path:
 
-## Scan wrapper
+~~~text
+.build/zmap-build/src/zmap
+~~~
 
-```bash
-sudo ./scripts/run_scan.sh \
-  .build/zmap-build/src/zmap \
-  targets.txt \
-  runs/example/raw_zmap.csv \
-  2001:db8::1 \
-  eth0 \
-  00:11:22:33:44:55 \
-  1000 \
-  10
-```
+See UPSTREAM_AUDIT.md for the source identity and the reason for each patch.
 
-Arguments are, in order: ZMap binary, ordered target file, output CSV, source
-IPv6 address, interface, gateway MAC, packets per second, and cooldown seconds.
-Use real authorized values on the Linux measurement host. The wrapper refuses to
-overwrite an existing raw result. It passes the interface as `-i`, the actual
-IPv6 packet source as `--ipv6-source-ip`, and `-S 0.0.0.0` to bypass this fork's
-IPv4 interface-address lookup during an IPv6 scan.
+### 2. Prepare the BGP input
 
-For a point-to-point IPv6 tunnel such as `ipv6net` (SIT/NOARP), pass `-` instead
-of a gateway MAC. The wrapper then uses ZMap's `--iplayer` mode. The build script
-applies the IPv6 protocol-tag fix to the extracted source; the upstream ZIP is
-unchanged. An Ethernet interface still uses its real gateway MAC as before.
+Download the current RIB from each configured RIPE RIS collector:
 
-The Windows checkout cannot compile or execute this packet engine. Final build
-and runtime verification therefore happens after this directory is copied to the
-Linux measurement server.
-
-## RIPE RIS input
-
-Install the small extraction toolchain on Debian/Ubuntu:
-
-```bash
-sudo apt-get install -y curl gzip bgpdump
-chmod +x scripts/*.sh
-```
-
-Download the latest RIB from every currently active RIPE RIS collector:
-
-```bash
+~~~bash
 ./scripts/download_ris.sh data/raw/ris/latest
-```
+~~~
 
-Decompress each RIB, run `bgpdump`, discard IPv4 rows, then merge and deduplicate
-IPv6 prefix/origin pairs:
+Extract IPv6 prefix and origin-AS rows:
 
-```bash
+~~~bash
 ./scripts/extract_ris_prefixes.sh \
   data/raw/ris/latest \
   data/interim/ris_ipv6_prefixes.csv
-```
+~~~
 
-The multi-collector prefix union is the selected campaign input. The scripts
-download the moving `latest-bview.gz` files; record each actual input identity
-and snapshot time separately if needed; the formal runner does not require
-snapshot metadata. The deduplicated prefix file still contains
-overlapping announcements and may contain prefixes longer than `/64`; it is not
-a target file.
+Collapse duplicate prefixes while retaining all reported origin ASNs:
 
-After curating known bad input rows, build the BGP prior tree and top-level-root
-summary before defining response-blind root strata:
+~~~bash
+./scripts/dedup_ris_prefixes.sh \
+  data/interim/ris_ipv6_prefixes.csv \
+  data/interim/ris_ipv6_prefixes_unique.csv
+~~~
 
-```bash
-python3 scripts/prepare_campaign.py \
+Create the non-overlapping top-level prefix file required by SubRecon:
+
+~~~bash
+python3 scripts/extract_top_level_prefixes.py \
   data/interim/ris_ipv6_prefixes_unique.csv \
-  runs/frame-preparation
-```
+  data/interim/ris_ipv6_top_level_prefixes.csv
+~~~
 
-The command refuses to overwrite its three outputs:
+The two inputs used by the strategies are now:
 
-- `bgp_tree.csv` retains every BGP prefix, origin set, immediate parent, root,
-  bit distance, true BGP tree depth, child count, and descendant count;
-- `frame_roots.csv` lists every intact nonoverlapping top-level root, its origin
-  metadata, tree features, and routed C64 count;
-- `summary.json` records structural counts, excluded rows, total routed C64
-  mass, root-length counts/C64 mass, and the root maximum-tree-depth histogram.
+~~~text
+data/interim/ris_ipv6_prefixes_unique.csv
+data/interim/ris_ipv6_top_level_prefixes.csv
+~~~
 
-The default preparation stage does not subdivide a short root or assign
-tranches. For the already completed D050 calibration, a response-blind root
-assignment selected the sampled roots before probing. That assignment remains
-only provenance of the D050 target plan; the final comparison uses the entire
-eligible routed tree and has no root-based evaluation split. The D050
-calibration C64/IID targets are emitted only when the historical root-assignment
-seed and a separate target seed are both supplied.
+The download command retrieves moving latest snapshots. Record the collection
+time and keep the downloaded files if the experiment must be reproducible.
 
-For the D050 plan, the recorded root-depth strata are `d0`, `d1`, `d2`, and
-`d3plus`. Re-running into a new output directory reproduces the historical
-one-fifth root assignment by deterministic hash rank:
+### 3. Create a run configuration
 
-```bash
-python3 scripts/prepare_campaign.py \
-  data/interim/ris_ipv6_prefixes_unique.csv \
-  runs/frame-root-split-native-v1 \
-  --exclude-prefix-file config/frame_exclusions.txt \
-  --split-seed 'bep-journal-root-split-v1-20260919' \
-  --calibration-root-fraction 1/5
-```
+For Adaptive BEP and SubRecon:
 
-Every prefix under one root receives the same historical tranche label. The
-summary reports root counts and C64 combinatorial mass for both sides and for
-each depth stratum. C64 mass is diagnostic only and does not control the formal
-probe budget.
+~~~bash
+cp formal.example.json experiment.json
+~~~
 
-`config/frame_exclusions.txt` currently excludes `2002::/16`. It is IANA
-special-purpose 6to4 transition space: native IPv6 routing sends the aggregate
-toward a 6to4 relay rather than treating it as ordinary operator-delegated C64
-space. The source RIS CSV remains unchanged, and the summary records every
-configured exclusion and the number of removed rows.
+For the other methods:
 
-After verifying the corrected frame and root split, generate the first
-calibration plan in a new directory:
+~~~bash
+cp bep_conference.example.json bep-conference.json
+cp tnet.example.json tnet.json
+~~~
 
-```bash
-python3 scripts/prepare_campaign.py \
-  data/interim/ris_ipv6_prefixes_unique.csv \
-  runs/calibration-plan-native-v1 \
-  --exclude-prefix-file config/frame_exclusions.txt \
-  --split-seed 'bep-journal-root-split-v1-20260919' \
-  --calibration-root-fraction 1/5 \
-  --calibration-target-seed 'bep-journal-calibration-targets-v1-20260919' \
-  --reference-iids 5
-```
+Edit the copied file before running it. At minimum, replace:
 
-The plan contains one `root_uniform` C64 per calibration root and, for every
-nontrivial BGP tree, one distinct `deepest_bgp_guided` C64 where possible. The
-uniform arm records its root, conditional C64, and overall inclusion
-probabilities. The guided arm is a purposive prior-enrichment comparison and
-has no design-based C64 inclusion probability. `calibration_units.csv` records
-the panels; `calibration_targets.csv` records every target; and
-`targets-search.txt` plus `targets-reference-1.txt` through
-`targets-reference-5.txt` are separately hash-shuffled scan rounds. The same
-inputs and seeds reproduce the same files.
+| Field | Meaning |
+| --- | --- |
+| scanner.source_ipv6 | Source IPv6 address assigned to the measurement host |
+| scanner.interface | Outgoing interface |
+| scanner.gateway_mac | IPv6 gateway MAC, or a dash for an IP-layer tunnel |
+| scanner.rate_pps | Global packet rate for this process |
+| scanner.cooldown_seconds | Receive tail after the last transmitted packet |
+| budget_total_per_method | Maximum probes charged to one method |
+| batch_size | Targets sent before the strategy receives feedback |
+| output_root | New directory for this experiment |
+| seed | Run-specific deterministic target seed |
 
-## Parse one scan round
+The example IPv6 address and MAC address are documentation values and must be
+replaced. Never reuse an output directory from a different configuration.
 
-Parse each raw round against the complete target manifest and its round name:
+Check that the JSON is valid:
 
-```bash
-python3 scripts/parse_results.py \
-  runs/calibration-plan-native-v1/calibration_targets.csv \
-  search \
-  runs/calibration-search/raw-search.csv \
-  runs/calibration-search/probes-search.csv
-```
+~~~bash
+python3 -m json.tool experiment.json >/dev/null
+~~~
 
-Valid round names are `search` and `reference-1` through `reference-5`. The
-parser uses the validated `orig-dest-ip` field to join a response to its unique
-planned target and computes RTT from the integer send and receive timestamps.
-It derives `direct`, `slow_au`, `fast_au`, `nr`, `ap`, `rr`, `tx`,
-`other_error`, `timeout`, or `unmatched`; only direct Echo Reply and Type 1
-Code 3 at RTT greater than or equal to 1000 ms set
-`is_observed_positive=1`. A JSON summary is written beside the parsed CSV.
-Multiple validated responses of the same class for one planned target are
-collapsed to the first arrival and their multiplicity is recorded. Different
-response classes for one target stop parsing; the raw CSV is left unchanged.
+### 4. Run one strategy
+
+Adaptive BEP:
+
+~~~bash
+sudo .venv/bin/python scripts/run_formal.py experiment.json adaptive_bep
+~~~
+
+SubRecon:
+
+~~~bash
+sudo .venv/bin/python scripts/run_formal.py experiment.json subrecon
+~~~
+
+Conference BEP and TNet use their own example configurations:
+
+~~~bash
+sudo .venv/bin/python scripts/run_formal.py \
+  bep-conference.json bep_conference
+
+sudo .venv/bin/python scripts/run_formal.py tnet.json tnet
+~~~
+
+Each command runs one independent method. Probe budgets and target history are
+not shared between methods.
+
+### 5. Stop and resume
+
+Send SIGINT or SIGTERM once for a graceful stop. The current scanner batch
+finishes, its evidence and checkpoint are archived, and the runner exits.
+
+Resume with the same configuration file and method name:
+
+~~~bash
+sudo .venv/bin/python scripts/run_formal.py \
+  experiment.json adaptive_bep --resume
+~~~
+
+The saved configuration must match exactly. A completed run cannot be resumed.
+
+If the process stopped before ZMap started, the next resume discards the
+unscanned work directory and regenerates that batch. If raw scan output exists,
+keep the work directory: resume parses and archives the existing result without
+sending the batch again.
+
+### 6. Analyze completed runs
+
+After every selected method has written summary.json:
+
+~~~bash
+.venv/bin/python scripts/analyze_formal.py \
+  experiment.json \
+  --methods adaptive_bep,subrecon
+~~~
+
+This creates:
+
+- comparison.csv: final cost and discovery totals
+- cost-discovery-curve.csv.gz: cumulative discoveries by probe cost
+
+Create detailed aggregates for one method:
+
+~~~bash
+.venv/bin/python scripts/summarize_formal.py \
+  runs/bep-comparison/adaptive_bep
+~~~
+
+The detailed summary includes response composition and budget by prefix length.
+
+## What counts as a discovery
+
+One probe targets one randomly selected address inside one /64. A /64 is
+counted as observed when the parser matches either:
+
+- an ICMPv6 Echo Reply from the target, or
+- an ICMPv6 Address Unreachable response whose measured round-trip time is at
+  least slow_au_threshold_ms.
+
+The matched outer source address of an Address Unreachable response is retained
+as a candidate last-hop router interface. It is an observed interface address,
+not a verified count of physical routers.
+
+## Batch files and checkpoints
+
+While a batch is running, its files are stored in a directory named
+batch-NNNNNNNNN.work. After parsing succeeds, the runner creates
+batch-NNNNNNNNN.tar.gz, verifies the archive, and removes the work directory.
+
+Each archive contains:
+
+- the ordered target manifest
+- the raw ZMap CSV
+- the exact scanner command and scanner version
+- compact per-probe evidence
+- strategy feedback aggregates
+- candidate last-hop router observations
+- the post-batch checkpoint
+- the scanner log
+
+Tables are stored as Parquet. Raw ZMap output remains CSV. Target generation and
+table writing are streamed so a complete batch is not duplicated in Python
+lists.
+
+The runner refuses to overwrite an existing run or result file.
+
+## Resource planning
+
+The configured budget is a ceiling, not an estimate of how long the strategy
+will remain productive.
+
+At rate R packets per second, transmission time for B probes is approximately:
+
+~~~text
+B / R seconds
+~~~
+
+For example, 5 billion probes at 1,000 packets per second require about 57.9
+days of transmission for one method. Batch cooldowns, parsing, compression, and
+downtime add to that duration.
+
+Adaptive BEP retains a BGP tree and a mixed-depth search frontier. Large runs
+need more memory than SubRecon even at the same probe count. Monitor resident
+memory and free disk space during pilot runs before selecting a full budget.
+
+## Adding a strategy
+
+A module under strategies/ provides:
+
+- load_frame(config, base_directory)
+- Strategy.iter_targets(limit)
+- Strategy.feed_aggregate(...)
+- Strategy.finish_batch()
+- Strategy.checkpoint()
+- Strategy.restore(state)
+
+See strategies/README.md for the complete contract. The runner imports the
+module named on the command line, so a new module does not require changes to
+the scanner.
+
+## Scanner provenance
+
+The vendored scanner archive comes from the public
+sbaresearch/icmpv6-destination-reachable artifact and is kept unchanged. Local
+build and IPv6 output fixes are applied as separate patch files. The archive
+identity, embedded revision, output fields, and patch rationale are recorded in
+UPSTREAM_AUDIT.md.
+
+## Known limits
+
+- The scanner build and packet transmission path are Linux-only.
+- TNet is implemented from the paper description because its source was not
+  available.
+- SubRecon uses a BGP-only starting set and therefore omits its external
+  hitlist-driven expansion input.
+- Internet-wide measurements can take days or months at conservative rates.
+- Strategy checkpoints are Python pickle files. Load checkpoints only from a
+  run directory you control.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one frozen, independent formal search through the existing ZMap parser.
+"""Run one independent measurement strategy through the ZMap parser.
 
 Each feedback round is one ZMap invocation (fixed target list plus one receive
 tail), so the strategy feedback batch and the scanner file batch are the same
@@ -77,7 +77,7 @@ def absolute(base, value):
 def allowance_for(cfg):
     total = int(cfg["budget_total_per_method"])
     if not 0 < total <= 100_000_000_000:
-        raise ValueError("formal method budget must be positive and stay within 100B")
+        raise ValueError("method budget must be positive and stay within 100B")
     return total
 
 
@@ -144,7 +144,7 @@ def archive_batch(folder, archive):
 def load_checkpoint(archives):
     """Load the latest committed checkpoint from its archive."""
     if not archives:
-        raise ValueError("formal run has no committed batch to resume")
+        raise ValueError("measurement run has no committed batch to resume")
     with tarfile.open(archives[-1], "r:gz") as bundle:
         names = set(bundle.getnames())
         if CHECKPOINT_NAME in names:
@@ -242,20 +242,20 @@ def run_method(config_path, method, resume=False):
     base = config_path.resolve().parent
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     if method not in cfg["strategies"]:
-        raise ValueError(f"method {method} is absent from formal configuration")
+        raise ValueError(f"method {method} is absent from the configuration")
     allowance = allowance_for(cfg)
     if int(cfg["batch_size"]) <= 0:
         raise ValueError("batch_size must be positive")
     output = absolute(base, cfg["output_root"]) / method
     if resume:
         if not output.is_dir():
-            raise FileNotFoundError(f"formal run does not exist: {output}")
+            raise FileNotFoundError(f"measurement run does not exist: {output}")
         if json.loads((output / "formal.json").read_text(encoding="utf-8")) != cfg:
             raise ValueError("resume configuration differs from the recorded run")
         if (output / "summary.json").exists():
-            raise FileExistsError(f"formal run is already complete: {output}")
+            raise FileExistsError(f"measurement run is already complete: {output}")
     elif output.exists():
-        raise FileExistsError(f"refusing to overwrite formal run: {output}")
+        raise FileExistsError(f"refusing to overwrite measurement run: {output}")
 
     strategy_module = importlib.import_module(f"strategies.{method}")
     frame = strategy_module.load_frame(cfg, base)

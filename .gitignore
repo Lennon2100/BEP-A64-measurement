@@ -1,3 +1,27 @@
 .build/
 data/
 runs/
+
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Machine-specific run configurations
+formal.json
+experiment.json
+tnet.json
+bep-conference.json
+
+# Local research notes and operating logs
+MEASUREMENT_RUNBOOK.md
+project_memory/
+*blueprint*.md
+
+# Retired local calibration workflow
+campaign.json
+scripts/analyze_action_trace.py
+scripts/analyze_campaign.py
+scripts/prepare_action_trace.py
+scripts/run_campaign.py
+tests/fixtures/action_trace_ris.csv

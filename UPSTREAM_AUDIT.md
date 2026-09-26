@@ -1,109 +1,90 @@
-# BValue upstream reuse audit
+# Scanner source and patches
 
-## Source identity
+## Upstream source
 
-- Artifact repository: `https://github.com/sbaresearch/icmpv6-destination-reachable`
-- Local read-only snapshot: `tmp/repo_snapshot/icmpv6-destination-reachable-main`
-- Selected scanner archive:
-  `measurements/zmap_versions/aim_zmap_reqnr_single.zip`
-- Archive SHA-256:
-  `c485e38576a0d59adeed7d3e9fcc607dfef95ecb3ca880b340d273099de9d44b`
-- Embedded AIM ZMap HEAD:
-  `30864522fe4f072744c54224791c2ac66a2a9261`
+The file vendor/aim_zmap_reqnr_single.zip was copied without modification from
+the public repository:
 
-The ZIP contains a dirty Git working tree. RTT payload support is committed in
-the embedded history (`6f85c303e116d2af75e7e1b332237731402a6ff9`), while the
-request-number changes in `module_icmp6_echoscan_time.c` and `send.c` are
-uncommitted. Therefore the ZIP hash, not HEAD alone, identifies the scanner used
-by this project.
+https://github.com/sbaresearch/icmpv6-destination-reachable
 
-## Reuse unchanged
+Upstream location:
 
-| Upstream component | Decision | Reason |
-| --- | --- | --- |
-| `aim_zmap_reqnr_single.zip` | Reuse exact archive | It contains the single-instance IPv6 scanner used by the artifact, including timestamp and quoted-packet recovery. |
-| `icmp6_echoscan_time` | Reuse initially | It embeds validation and send time, validates Echo Replies and ICMPv6 errors, and recovers the original destination from quoted inner headers. |
-| Generic ZMap CSV output | Reuse | It already supplies receive time and outer source address. |
-| CMake build | Reuse through a thin script | No separate packet engine is needed. |
+~~~text
+measurements/zmap_versions/aim_zmap_reqnr_single.zip
+~~~
 
-The selected scanner already exposes the facts needed for the first measurement
-slice:
+Archive SHA-256:
 
-| Required fact | Existing field or behavior |
+~~~text
+c485e38576a0d59adeed7d3e9fcc607dfef95ecb3ca880b340d273099de9d44b
+~~~
+
+Embedded Git revision:
+
+~~~text
+30864522fe4f072744c54224791c2ac66a2a9261
+~~~
+
+The archive contains request-number changes that are not represented by the
+embedded revision alone. The archive hash is therefore the reproducible source
+identity used by this repository.
+
+## Why this scanner is used
+
+The ICMPv6 Echo measurement module provides the fields required to associate a
+response with its original target and calculate round-trip time:
+
+| Measurement fact | Scanner field |
 | --- | --- |
-| Original/quoted target | `orig-dest-ip` |
-| Probe identity | internal validation plus a unique target per scan; patched `nrsent` is emitted for Echo Replies and quoted ICMPv6 errors |
-| Send timestamp | `sent_timestamp_ts`, `sent_timestamp_us` |
-| Receive timestamp | generic `timestamp_ts`, `timestamp_us` (also retain `timestamp_str`) |
-| ICMPv6 type/code | module fields `type`, `code` |
-| Outer source address | generic `saddr` |
+| Original destination | orig-dest-ip |
+| Outer response source | saddr |
+| ICMPv6 type and code | type, code |
+| Send time | sent_timestamp_ts, sent_timestamp_us |
+| Receive time | timestamp_ts, timestamp_us |
+| Probe request number | nrsent |
 
-The observed Echo CSV shift requires one probe-module correction even when each
-target appears only once: emit `nrsent` for Echo Replies as well as errors so
-the positional output matches its declared fields. The patch also requires the
-full 20-byte quoted payload before reading the request number. If a future
-strategy sends repeated probes to the identical target in one invocation,
-matching by request number must also be revisited.
+The parser keeps raw output unchanged and derives response classes in a
+separate step.
 
-## Reuse as ideas, not as executable project code
+## Local patches
 
-- Use a fixed RIPE RIS RIB/MRT snapshot as the routed frame.
-- Generate targets within the BGP boundary using an explicit bit/IID policy.
-- Recover the original target from quoted ICMPv6 error packets.
-- Preserve send/receive timestamps and derive RTT offline.
+The build script extracts the archive under .build/ and applies four patches.
+The vendored ZIP is never modified.
 
-## Do not reuse directly
+### 0001-cmake-json-c-flags.patch
 
-| Upstream file or workflow | Reason |
-| --- | --- |
-| `bvalues.ipynb` | It orchestrates reproduction and plotting, not a deployable measurement runtime. |
-| `bvalues/tools/bgp/extract_bgp.sh` | It downloads mutable `latest-bview` files, merges 25 collectors, prompts interactively, and deletes working directories. |
-| `filter_addr_list_on_bgp.py` | It implements Hitlist-seeded one-address-per-BGP-prefix selection, which is the opposite direction from the journal search. |
-| `gen_bvalues.py` | It expands outward from known responsive `/128` seeds and uses unrecorded Python randomness. |
-| `gen_48_subs.py` | It materializes huge target strings and uses one fixed IID globally. |
-| Original `scan_zmap.sh` files | They contain hard-coded paths/rates, interactive overwrite prompts, incomplete output fields, and no strict shell error handling. |
-| `rtt.py` | It depends on pandas for a two-column subtraction and rewrites the raw scan file in place. Raw scanner output must remain immutable. |
-| BValue classification/plotting scripts | They encode the paper's Hitlist experiment and its labels, not the journal A64 search/reference separation. |
-| Parallel ZMap archive | Its pacing changes serve concurrent rate-limit experiments, which are outside the current measurement design. |
+Modern CMake exposes JSON_CFLAGS as a list. The upstream build appends that list
+to a string, which turns separators into shell commands. The patch removes the
+redundant assignment; the existing include and link directives already provide
+the json-c paths.
 
-## Minimal additions
+### 0002-gengetopt-relative-includes.patch
 
-1. A reproducible Linux build wrapper for the exact scanner ZIP.
-2. A non-interactive, low-rate scan wrapper requesting all required raw fields.
-3. Independent strategy programs that emit the common target-file contract.
-4. Later, after data collection requires them, separate parsing and evaluation
-   scripts that never modify raw ZMap output.
+Five generated C files contain absolute header paths from the upstream build
+machine. The patch changes only those includes to local header names.
 
-### Modern CMake compatibility patch
+### 0003-ipv6-iplayer-ethertype.patch
 
-Ubuntu with modern CMake/pkg-config exposes `JSON_CFLAGS` as a semicolon-separated
-CMake list. The old upstream line that appends this list to the string-valued
-`CMAKE_C_FLAGS` turns those semicolons into shell command separators, producing
-`cc: fatal error: no input files` and `-I/usr/include/json-c: not found`.
+In IP-layer mode the upstream sender marks all packets as IPv4. On an IPv6
+tunnel this emits protocol 4 instead of protocol 41. The patch selects the IPv6
+EtherType for IPv6 probes and leaves the IPv4 path unchanged.
 
-`patches/0001-cmake-json-c-flags.patch` removes only that redundant assignment.
-The preceding `include_directories(${JSON_INCLUDE_DIRS})` and existing
-`${JSON_LIBRARIES}` linkage already provide the required json-c build settings.
-The build wrapper applies the patch to the extracted working copy and never
-modifies the archived upstream source.
+### 0004-icmp6-echo-field-alignment.patch
 
-The ZIP also contains five pre-generated gengetopt C files whose header includes
-refer to the original author's absolute `/home/qwerty/...` build path. The
-matching generated headers are present in the same source directory, so
-`patches/0002-gengetopt-relative-includes.patch` changes only those five includes
-to `"zopt.h"`, `"topt.h"`, `"zbopt.h"`, `"zitopt.h"`, and `"ztopt.h"`.
+The Echo Reply output path omits nrsent even though the field is declared. That
+shifts later CSV values into the wrong columns. The patch emits nrsent for Echo
+Replies and checks that a quoted ICMPv6 packet contains the complete request
+payload before reading it.
 
-On the server's SIT/NOARP `ipv6net` interface, an allowed single-target check
-showed a valid ICMPv6 request leaving ZMap as IPv4 protocol 4 (IPIP) instead of
-IPv6-in-IPv4 protocol 41; normal `ping6` used protocol 41 and received a reply.
-`patches/0003-ipv6-iplayer-ethertype.patch` corrects the IP-layer packet tag for
-IPv6 while keeping the IPv4 branch unchanged. It is applied only to the
-extracted build tree. The user reports that the patched scanner sent an outer
-protocol-41 Echo Request and received its Reply, but the Echo CSV row is not
-yet usable: `nrsent` is absent in that probe-module branch, shifting subsequent
-positional fields, including `classification` and receive time.
-`patches/0004-icmp6-echo-field-alignment.patch` addresses that field shift;
-server-side rebuild and output checks remain pending.
+## Build behavior
 
-The ceiling is deliberate: no package framework, generic plug-in loader,
-database, workflow engine, or policy state machine is introduced in this slice.
+scripts/build_zmap.sh:
+
+1. verifies the archive SHA-256;
+2. extracts it under .build/;
+3. applies each patch only when the expected upstream line is present;
+4. refuses to continue when the source does not match the expected form;
+5. builds the scanner with CMake.
+
+This keeps the upstream archive intact and makes every local source change
+reviewable as a small patch.

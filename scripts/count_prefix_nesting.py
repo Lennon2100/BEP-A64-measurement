@@ -3,7 +3,7 @@
 
 Reads the output of dedup_ris_prefixes.sh (one unique IPv6 prefix per row, the
 prefix in the first comma-separated field) and reports the counts needed to
-build the full-C64 frame under D042/D044:
+build the routed /64 search frame:
 
   - total unique prefixes
   - the IPv6 default route ::/0 (excluded: a catch-all, not a real routed block)
@@ -80,7 +80,7 @@ def main(argv):
 
     all_prefixes = load_prefixes(args.input)
 
-    # D042/D044: announcements longer than /64 do not define a whole C64. The IPv6
+    # Announcements longer than /64 do not define a whole /64. The IPv6
     # default route ::/0 (prefixlen 0) is a catch-all, not a routed block, so
     # it is excluded from the frame as well.
     long_prefixes = {p for p in all_prefixes if p.prefixlen > 64}

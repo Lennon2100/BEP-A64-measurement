@@ -55,7 +55,7 @@ class Frame:
                 self.deepest[parent] = max(self.deepest[parent], self.deepest[prefix])
 
     @classmethod
-    def journal(cls, prefix_csv, frame_exclusions):
+    def from_bgp_prefixes(cls, prefix_csv, frame_exclusions):
         rows, _ = load_rows(prefix_csv, load_exclusions(frame_exclusions))
         prefixes = set(rows)
         return cls(prefixes, build_immediate_parent_map(prefixes))
