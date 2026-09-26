@@ -117,9 +117,17 @@ Edit these fields:
 | `scanner.rate_pps` | Packet rate |
 | `scanner.cooldown_seconds` | Receive tail after transmission |
 | `budget_total_per_method` | Probe ceiling for each method |
-| `batch_size` | Probes sent before strategy feedback |
+| `batch_size` | Maximum probes sent before strategy feedback |
+| `strategies.adaptive_bep.feedback_batch_size` | Adaptive BEP feedback-round ceiling |
+| `strategies.adaptive_bep.frontier_limit` | Maximum active Adaptive BEP nodes retained after a round |
+| `strategies.adaptive_bep.credible_z` | Normal credible-bound multiplier used for BEP pruning |
+| `strategies.adaptive_bep.expansion_cost` | Depth-adaptive BEP pruning threshold coefficient |
 | `output_root` | New run directory |
 | `seed` | Run-specific target seed |
+
+Adaptive BEP applies the paper's depth-adaptive credible-bound pruning after
+each feedback round. It then retains at most `frontier_limit` active nodes; the
+limit bounds memory when many nodes have similar scores.
 
 ### 4. Run a method
 

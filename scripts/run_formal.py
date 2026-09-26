@@ -3,8 +3,9 @@
 
 Each feedback round is one ZMap invocation (fixed target list plus one receive
 tail), so the strategy feedback batch and the scanner file batch are the same
-thing; the configurable `batch_size` sets that round.  Targets are generated
-and written to disk as a stream, never materialised as full per-target lists.
+thing. `batch_size` sets its maximum size, and a strategy may impose a smaller
+round ceiling. Targets are generated and written to disk as a stream, never
+materialised as full per-target lists.
 Every successful archive contains the compact post-batch `state.pkl.gz`; resume
 loads that checkpoint without replaying historical probe rows.
 """
@@ -294,6 +295,9 @@ def run_method(config_path, method, resume=False):
         if state:
             strategy.restore(state["strategy"])
             targets.restore(state["targets"])
+            compact = getattr(strategy, "compact_restored_state", None)
+            if compact is not None:
+                compact()
             load_recovered_targets(output, targets)
             last_hop_routers.update(
                 int(ipaddress.IPv6Address(router))

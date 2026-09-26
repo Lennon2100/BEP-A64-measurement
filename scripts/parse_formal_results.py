@@ -7,7 +7,7 @@ import ipaddress
 import json
 import os
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -155,6 +155,25 @@ def load_raw(path, threshold):
     return responses, rows, invalid
 
 
+def new_feedback():
+    return {
+        "probes": 0, "positives": 0, "replies": 0, "sources": set(),
+        "bep_active": 0, "bep_inactive": 0, "bep_null": 0,
+    }
+
+
+def write_feedback(writer, key, item):
+    node, mode = key
+    writer.write({
+        "node": node, "mode": mode, "probes": item["probes"],
+        "positives": item["positives"], "replies": item["replies"],
+        "sources": json.dumps(sorted(item["sources"])),
+        "bep_active": item["bep_active"],
+        "bep_inactive": item["bep_inactive"],
+        "bep_null": item["bep_null"],
+    })
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest")
@@ -170,15 +189,14 @@ def main(argv=None):
 
     try:
         responses, raw_count, invalid_count = load_raw(args.raw, args.slow_au_threshold_ms)
-        feedback = defaultdict(lambda: {
-            "probes": 0, "positives": 0, "replies": 0, "sources": set(),
-            "bep_active": 0, "bep_inactive": 0, "bep_null": 0,
-        })
         statuses = Counter()
         classes = Counter()
         planned = positives = multi = cross_class = 0
         probe_writer = StringParquetWriter(args.probes, PROBE_FIELDS)
         router_writer = StringParquetWriter(args.routers, ROUTER_FIELDS)
+        feedback_writer = StringParquetWriter(args.feedback, FEEDBACK_FIELDS)
+        feedback_key = None
+        aggregate = None
         manifest_path = Path(args.manifest)
         for row in iter_table_file(manifest_path, manifest_path.with_suffix(".csv")):
             planned += 1
@@ -199,7 +217,11 @@ def main(argv=None):
                 source = rtt = raw_line = None
                 status, cls, positive = "timeout", "timeout", 0
             key = (row["node"], row["mode"])
-            aggregate = feedback[key]
+            if key != feedback_key:
+                if feedback_key is not None:
+                    write_feedback(feedback_writer, feedback_key, aggregate)
+                feedback_key = key
+                aggregate = new_feedback()
             aggregate["probes"] += 1
             aggregate["positives"] += positive
             aggregate["replies"] += bool(found and found.reply)
@@ -241,19 +263,10 @@ def main(argv=None):
                 "rtt_ms": f"{rtt:.3f}" if rtt is not None else "",
                 "raw_row_number": raw_line if raw_line is not None else "",
             })
+        if feedback_key is not None:
+            write_feedback(feedback_writer, feedback_key, aggregate)
         probe_writer.close()
         router_writer.close()
-
-        feedback_writer = StringParquetWriter(args.feedback, FEEDBACK_FIELDS)
-        for (node, mode), item in feedback.items():
-            feedback_writer.write({
-                "node": node, "mode": mode, "probes": item["probes"],
-                "positives": item["positives"], "replies": item["replies"],
-                "sources": json.dumps(sorted(item["sources"])),
-                "bep_active": item["bep_active"],
-                "bep_inactive": item["bep_inactive"],
-                "bep_null": item["bep_null"],
-            })
         feedback_writer.close()
         summary = {
             "planned_probe_count": planned, "raw_response_count": raw_count,

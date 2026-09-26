@@ -25,7 +25,11 @@
       "prior_decay": 0.85,
       "information_weight": 0.25,
       "bgp_weight": 0.25,
-      "root_budget_fraction": 0.5
+      "root_budget_fraction": 0.5,
+      "credible_z": 1.96,
+      "expansion_cost": 1.0,
+      "feedback_batch_size": 250000,
+      "frontier_limit": 100000
     },
     "subrecon": {}
   },

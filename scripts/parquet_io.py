@@ -12,7 +12,7 @@ import io
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-ROW_GROUP = 200_000
+ROW_GROUP = 25_000
 
 
 class StringParquetWriter:

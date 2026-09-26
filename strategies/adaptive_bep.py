@@ -10,7 +10,8 @@ drawn by an ancestor (dedup), so an ancestor's higher-level uniform probe is
 never re-sent and reduces the descendant's unsatisfied base by exactly the
 number of already-probed /64s that fall in it.
 
-State is O(screened nodes); cross-level dedup is cursor-based (see Targets).  A
+State is O(retained frontier nodes and their ancestors); cross-level dedup is
+cursor-based (see Targets).  A
 "search layer" is one frontier scheduling round over nodes of possibly
 different absolute lengths.
 """
@@ -52,6 +53,10 @@ class Strategy:
         self.prior_decay = float(cfg["prior_decay"])
         self.bgp_weight = float(cfg["bgp_weight"])
         self.root_fraction = float(cfg["root_budget_fraction"])
+        self.credible_z = float(cfg.get("credible_z", 1.96))
+        self.expansion_cost = float(cfg.get("expansion_cost", 1.0))
+        self.feedback_batch_size = int(cfg.get("feedback_batch_size", 250_000))
+        self.frontier_limit = int(cfg.get("frontier_limit", 100_000))
         if not (
             self.theta > 0
             and self.prior_strength > 0
@@ -61,6 +66,10 @@ class Strategy:
             and 0 < self.root_fraction < 1
             and self.steps
             and all(1 <= step <= 8 for step in self.steps)
+            and self.credible_z > 0
+            and self.expansion_cost > 0
+            and self.feedback_batch_size >= 1 << max(self.steps)
+            and self.frontier_limit > 0
         ):
             raise ValueError("invalid adaptive BEP search coefficients or step_bits")
 
@@ -126,6 +135,18 @@ class Strategy:
         information = _entropy(p) - p * _entropy((a + 1) / (a + b + 1)) - (1 - p) * _entropy(a / (a + b + 1))
         bgp_bonus = self.bgp_weight * self.nodes[prefix]["bgp_signal"]
         return p + self.info_weight * information + bgp_bonus
+
+    def _credible_lower(self, prefix):
+        alpha, beta = self._posterior(prefix)
+        total = alpha + beta
+        mean = alpha / total
+        variance = alpha * beta / (total * total * (total + 1))
+        return max(0.0, mean - self.credible_z * math.sqrt(variance))
+
+    def _should_expand(self, prefix):
+        descendants = 1 << (64 - prefix.prefixlen)
+        threshold = self.expansion_cost / descendants
+        return self._credible_lower(prefix) > threshold
 
     # ---- activation and child selection --------------------------------------
 
@@ -239,6 +260,9 @@ class Strategy:
             if prefix.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
                 rec["closed"] = True
                 continue
+            if self._node_sent(rec) >= rec["quota"] and not self._should_expand(prefix):
+                rec["closed"] = True
+                continue
             score = self._score(prefix)
             if rec["heap_score"] is not None and abs(score - rec["heap_score"]) < 1e-12:
                 return prefix
@@ -308,7 +332,7 @@ class Strategy:
         return plan
 
     def iter_targets(self, limit):
-        for node, count, mode in self._plan(limit):
+        for node, count, mode in self._plan(min(limit, self.feedback_batch_size)):
             ancestors = []
             parent = self.nodes[node]["parent"]
             while parent is not None:
@@ -335,23 +359,85 @@ class Strategy:
         self.sent += probes
         self.positive_count += positives
 
+    def _drop_leaf(self, node):
+        while node in self.nodes and not self.nodes[node]["children"]:
+            parent = self.nodes[node]["parent"]
+            del self.nodes[node]
+            self.cache.pop(node, None)
+            self.targets.positions.pop(node, None)
+            if parent is None or parent not in self.nodes:
+                return
+            children = self.nodes[parent]["children"]
+            if node in children:
+                children.remove(node)
+            if not self.nodes[parent]["closed"]:
+                return
+            node = parent
+
+    def _rebuild_child_links(self):
+        for rec in self.nodes.values():
+            rec["children"] = []
+        for node, rec in self.nodes.items():
+            parent = rec["parent"]
+            if parent in self.nodes:
+                self.nodes[parent]["children"].append(node)
+
+    def _frontier_score(self, node):
+        score = self._score(node)
+        if len(self.cache) >= self.frontier_limit:
+            self.cache.clear()
+        return score
+
+    def _compact_frontier(self):
+        # Older checkpoints cleared completed parents' child lists. Rebuild
+        # direct links before recursive leaf deletion so live descendants stay.
+        self._rebuild_child_links()
+        candidates = []
+        closed_leaves = []
+        for node, rec in self.nodes.items():
+            if rec["closed"]:
+                if not rec["children"]:
+                    closed_leaves.append(node)
+                continue
+            if rec["blocked"]:
+                continue
+            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
+                rec["closed"] = True
+                closed_leaves.append(node)
+                continue
+            if self._node_sent(rec) >= rec["quota"] and not self._should_expand(node):
+                rec["closed"] = True
+                closed_leaves.append(node)
+                continue
+            candidates.append(node)
+
+        keep = set(heapq.nlargest(
+            self.frontier_limit,
+            candidates,
+            key=lambda node: (self._frontier_score(node), -int(node.network_address)),
+        ))
+        for node in candidates:
+            if node not in keep:
+                self._drop_leaf(node)
+        for node in closed_leaves:
+            self._drop_leaf(node)
+
+        self.cache.clear()
+        self.heap = []
+        self.seq = 0
+        for node in sorted(keep, key=lambda prefix: int(prefix.network_address)):
+            if node in self.nodes:
+                self._heap_push(node)
+
     def finish_batch(self):
         for parent in self._completed_splits:
             for child in self.nodes[parent]["children"]:
                 self.nodes[child]["blocked"] = False
-            self.nodes[parent]["children"] = []
-        for node in self._touched:
-            rec = self.nodes[node]
-            if rec["closed"] or rec["blocked"]:
-                continue
-            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
-                rec["closed"] = True
-                continue
-            self._heap_push(node)
-        self._touched.clear()
-        self._completed_splits.clear()
         self.epoch += 1
         self.cache.clear()
+        self._compact_frontier()
+        self._touched.clear()
+        self._completed_splits.clear()
 
     def adopt_manifest_actions(self, actions):
         root_indexes = {root: index for index, root in enumerate(self.root_order)}
@@ -372,14 +458,14 @@ class Strategy:
             self._touched.add(node)
 
     def rebuild_after_recovery(self):
-        self.heap = []
-        self.seq = 0
-        for node, rec in self.nodes.items():
-            if rec["closed"] or rec["blocked"]:
-                continue
-            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
-                continue
-            self._heap_push(node)
+        self.epoch += 1
+        self.cache.clear()
+        self._compact_frontier()
+
+    def compact_restored_state(self):
+        self.epoch += 1
+        self.cache.clear()
+        self._compact_frontier()
 
     def snapshot(self):
         return {
