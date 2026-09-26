@@ -1,29 +1,45 @@
-"""BEP-derived HD base allocation with lazy, mixed-depth Bayesian search.
+"""BGP-first bounded-memory test strategy for the legacy journal method.
 
-Block-level scheduling: one feedback round decides a plan of `(node, count)`
-actions in a single frontier pass, then streams targets.  No per-probe
-re-scoring.  Every probe is drawn uniformly within exactly one node (the
-action's node) and updates only that node's Beta counts; a probe drawn in a
-child is uniform in the child and is not a uniform sample of its ancestors.
-Cross-level reuse is automatic: a descendant's permutation skips /64s already
-drawn by an ancestor (dedup), so an ancestor's higher-level uniform probe is
-never re-sent and reduces the descendant's unsatisfied base by exactly the
-number of already-probed /64s that fall in it.
+Phase one exhaustively probes the union of announced BGP prefixes from /48
+through /64, visiting more-specific announcements first. Overlapping
+announcements are partitioned into disjoint /64 intervals, so every physical
+probe is charged once.
 
-State is O(screened nodes); cross-level dedup is cursor-based (see Targets).  A
-"search layer" is one frontier scheduling round over nodes of possibly
-different absolute lengths.
+Phase two partitions the remaining space announced by prefixes shorter than
+/48 into lazy /48 ranges. A global heap contains one record per range rather
+than one record per generated tree node. The best range contributes one /48;
+all /64s in that /48 not already covered in phase one are then probed.
 """
 
+import bisect
 import heapq
 import ipaddress
 import math
+from array import array
 
 from strategies.common import Frame
 
 
+STATE_VERSION = 2
+FULL_C48 = 1 << 16
+
+
 def _entropy(q):
     return 0.0 if q in (0.0, 1.0) else -q * math.log(q) - (1.0 - q) * math.log(1.0 - q)
+
+
+def _gaps(start, stop, exclusions):
+    cursor = start
+    for excluded_start, excluded_stop in sorted(exclusions):
+        if excluded_stop <= cursor:
+            continue
+        if excluded_start > cursor:
+            yield cursor, min(excluded_start, stop)
+        cursor = max(cursor, excluded_stop)
+        if cursor >= stop:
+            return
+    if cursor < stop:
+        yield cursor, stop
 
 
 def load_frame(cfg, base):
@@ -35,444 +51,248 @@ def load_frame(cfg, base):
 
 class Strategy:
     name = "journal"
+    minimum_batch_size = FULL_C48
 
     def __init__(self, frame, targets, cfg, allowance):
         self.frame = frame
         self.targets = targets
         self.allowance = allowance
-        self.theta = float(cfg["theta_b"])
-        self.steps = tuple(cfg["step_bits"])
-        self.info_weight = float(cfg["information_weight"])
         self.prior_strength = float(cfg["prior_strength"])
-        self.prior_decay = float(cfg["prior_decay"])
+        self.info_weight = float(cfg["information_weight"])
         self.bgp_weight = float(cfg["bgp_weight"])
-        self.root_fraction = float(cfg["root_budget_fraction"])
-        if not (
-            self.theta > 0
-            and self.prior_strength > 0
-            and 0 < self.prior_decay <= 1
-            and self.info_weight >= 0
-            and self.bgp_weight >= 0
-            and 0 < self.root_fraction < 1
-            and self.steps
-            and all(1 <= step <= 8 for step in self.steps)
-        ):
-            raise ValueError("invalid journal search coefficients or step_bits")
+        if self.prior_strength <= 0 or self.info_weight < 0 or self.bgp_weight < 0:
+            raise ValueError("invalid journal search coefficients")
 
-        # Base and adaptive samples are kept separately.  Both are uniform in
-        # this node and therefore both are valid for its local likelihood.
-        self.nodes = {}
-        self.cache = {}          # prefix -> (alpha, beta, epoch) posterior memo
-        self.epoch = 0
-        self.heap = []           # (-score, seq, prefix) lazy-max heap
-        self.seq = 0
-        self.sent = 0
-        self.positive_count = 0
-        self.root_order = sorted(frame.roots, key=lambda p: (-frame.descendants[p], str(p)))
-        self.root_index = 0
-        self.root_phase_budget = allowance * self.root_fraction
-        root_base_total = sum(self.base(root) for root in self.root_order)
-        if root_base_total > self.root_phase_budget:
-            if root_base_total > allowance:
-                raise ValueError(
-                    f"journal root bases require {root_base_total} probes, "
-                    f"exceeding allowance {allowance}"
-                )
-            required_fraction = root_base_total / allowance
-            raise ValueError(
-                f"journal root bases require {root_base_total} probes; "
-                f"root_budget_fraction must be at least {required_fraction:.6f}"
-            )
-        self._touched = set()
-        self._completed_splits = set()
+        self.cover_segments = self._cover_segments()
+        self.deep_intervals, self.deep_starts = self._deep_union()
+        self.cover_index = 0
+        self.cover_cursor = self.cover_segments[0][1] if self.cover_segments else 0
 
-    # ---- quota and posterior -------------------------------------------------
-
-    def base(self, prefix):
-        if prefix.prefixlen == 64:
-            return 1
-        count = 1 << (64 - prefix.prefixlen)
-        return min(count, max(1, math.ceil(self.theta * 2 ** ((56 - prefix.prefixlen) / 4))))
-
-    def _posterior(self, prefix):
-        rec = self.nodes[prefix]
-        hit = self.cache.get(prefix)
-        if hit is not None and hit[2] == self.epoch:
-            return hit[0], hit[1]
-        if rec["parent"] is None:
-            a0 = b0 = self.prior_strength / 2
-        else:
-            pa, pb = self._posterior(rec["parent"])
-            mean = pa / (pa + pb)
-            strength = max(
-                0.02,
-                self.prior_strength
-                * self.prior_decay ** (prefix.prefixlen - rec["parent"].prefixlen),
-            )
-            a0, b0 = mean * strength, (1 - mean) * strength
-        alpha = rec["base_yes"] + rec["adaptive_yes"] + a0
-        beta = rec["base_no"] + rec["adaptive_no"] + b0
-        self.cache[prefix] = (alpha, beta, self.epoch)
-        return alpha, beta
-
-    def _score(self, prefix):
-        a, b = self._posterior(prefix)
-        p = a / (a + b)
-        information = _entropy(p) - p * _entropy((a + 1) / (a + b + 1)) - (1 - p) * _entropy(a / (a + b + 1))
-        bgp_bonus = self.bgp_weight * self.nodes[prefix]["bgp_signal"]
-        return p + self.info_weight * information + bgp_bonus
-
-    # ---- activation and child selection --------------------------------------
-
-    def _bgp_signal(self, root, count, deepest):
-        if not count:
-            return 0.0
-        root_count = len(self.frame.prefixes_by_root[root])
-        density = math.log1p(count) / math.log1p(root_count)
-        return (deepest / 64 + density) / 2
-
-    def _node_bgp_stats(self, prefix, root):
-        if prefix in self.frame.prefix_set:
-            children = self.frame.children.get(prefix, ())
-            return (
-                self.frame.descendants[prefix] + 1,
-                self.frame.deepest[prefix],
-                min((child.prefixlen for child in children), default=None),
-            )
-        contained = [
-            candidate
-            for candidate in self.frame.prefixes_by_root[root]
-            if candidate.subnet_of(prefix)
-        ]
-        return (
-            len(contained),
-            max((candidate.prefixlen for candidate in contained), default=0),
-            min(
-                (candidate.prefixlen for candidate in contained if candidate.prefixlen > prefix.prefixlen),
-                default=None,
-            ),
-        )
-
-    def _activate(self, prefix, parent, blocked=False, bgp_stats=None):
-        ancestors = []
-        ancestor = parent
-        while ancestor is not None:
-            ancestors.append(ancestor)
-            ancestor = self.nodes[ancestor]["parent"]
-        quota = max(0, self.base(prefix) - self.targets.prior_count(prefix, ancestors))
-        root = prefix if parent is None else self.nodes[parent]["root"]
-        if bgp_stats is None:
-            bgp_stats = self._node_bgp_stats(prefix, root)
-        bgp_count, bgp_deepest, nearest_bgp_length = bgp_stats
-        self.nodes[prefix] = {
-            "parent": parent,
-            "root": root,
-            "quota": quota,
-            "base_yes": 0,
-            "base_no": 0,
-            "adaptive_yes": 0,
-            "adaptive_no": 0,
-            "closed": False,
-            "blocked": blocked,
-            "children": [],
-            "bgp_signal": self._bgp_signal(root, bgp_count, bgp_deepest),
-            "nearest_bgp_length": nearest_bgp_length,
-            "heap_score": None,
-        }
-
-    def _choose_step(self, prefix):
-        rec = self.nodes[prefix]
-        nearest = rec["nearest_bgp_length"]
-        gap = nearest - prefix.prefixlen if nearest is not None else 1
-        valid = [step for step in self.steps if prefix.prefixlen + step <= 64]
-        return max((step for step in valid if step <= gap), default=min(valid, default=None))
-
-    def _child_bgp_stats(self, prefix, step):
-        """Avoid rescanning the same BGP subtree separately for every sibling."""
-        child_length = prefix.prefixlen + step
-        child_count = 1 << step
-        child_size = 1 << (128 - child_length)
-        start = int(prefix.network_address)
-        child_stats = [[0, 0, None] for _ in range(child_count)]
-        root = self.nodes[prefix]["root"]
-        for candidate in self.frame.prefixes_by_root[root]:
-            if candidate.prefixlen < child_length or not candidate.subnet_of(prefix):
-                continue
-            index = (int(candidate.network_address) - start) // child_size
-            stats = child_stats[index]
-            stats[0] += 1
-            stats[1] = max(stats[1], candidate.prefixlen)
-            if candidate.prefixlen > child_length:
-                stats[2] = (
-                    candidate.prefixlen
-                    if stats[2] is None
-                    else min(stats[2], candidate.prefixlen)
-                )
-        return child_stats
-
-    @staticmethod
-    def _child_at(prefix, step, index):
-        length = prefix.prefixlen + step
-        size = 1 << (128 - length)
-        address = int(prefix.network_address) + index * size
-        return ipaddress.ip_network((address, length))
-
-    # ---- frontier heap --------------------------------------------------------
-
-    def _heap_push(self, prefix):
-        score = self._score(prefix)
-        self.nodes[prefix]["heap_score"] = score
-        heapq.heappush(self.heap, (-score, self.seq, prefix))
-        self.seq += 1
-
-    def _heap_pop(self):
-        while self.heap:
-            _, _, prefix = heapq.heappop(self.heap)
-            rec = self.nodes.get(prefix)
-            if rec is None or rec["closed"] or rec["blocked"]:
-                continue
-            if prefix.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
-                rec["closed"] = True
-                continue
-            score = self._score(prefix)
-            if rec["heap_score"] is not None and abs(score - rec["heap_score"]) < 1e-12:
-                return prefix
-            rec["heap_score"] = score
-            heapq.heappush(self.heap, (-score, self.seq, prefix))
-            self.seq += 1
-        return None
-
-    # ---- planning and streaming ----------------------------------------------
-
-    def _plan(self, limit):
-        plan = []
-        remaining = limit
-        planned = self.sent
-        while remaining > 0 and self.root_index < len(self.root_order) and planned < self.root_phase_budget:
-            root = self.root_order[self.root_index]
-            self.root_index += 1
-            quota = self.base(root)
-            if quota > self.allowance - planned:
-                raise RuntimeError("journal root-base preflight invariant failed")
-            self._activate(root, None)
-            count = min(remaining, quota)
-            plan.append((root, count, "base"))
-            self._touched.add(root)
-            planned += count
-            remaining -= count
-        while remaining > 0:
-            node = self._heap_pop()
-            if node is None:
-                break
-            rec = self.nodes[node]
-            sent = self._node_sent(rec)
-            if sent < rec["quota"]:
-                count = min(remaining, rec["quota"] - sent)
-                mode = "base"
-            else:
-                step = self._choose_step(node)
-                if step is None:
-                    self.nodes[node]["closed"] = True
-                    continue
-                child_count = 1 << step
-                if remaining < child_count:
-                    self._touched.add(node)
-                    break
-                child_bgp_stats = self._child_bgp_stats(node, step)
-                for index in range(child_count):
-                    child = self._child_at(node, step, index)
-                    if child in self.nodes:
-                        raise RuntimeError(f"journal split produced existing child {child}")
-                    self._activate(
-                        child,
-                        node,
-                        blocked=True,
-                        bgp_stats=child_bgp_stats[index],
-                    )
-                    rec["children"].append(child)
-                    mode = "base" if self.nodes[child]["quota"] else "dynamic"
-                    plan.append((child, 1, mode))
-                    self._touched.add(child)
-                    remaining -= 1
-                rec["closed"] = True
-                self._completed_splits.add(node)
-                continue
-            plan.append((node, count, mode))
-            self._touched.add(node)
-            remaining -= count
-        return plan
-
-    def iter_targets(self, limit):
-        for node, count, mode in self._plan(limit):
-            ancestors = []
-            parent = self.nodes[node]["parent"]
-            while parent is not None:
-                ancestors.append(parent)
-                parent = self.nodes[parent]["parent"]
-            for _ in range(count):
-                c64 = self.targets.draw(node, ancestors)
-                if c64 is None:
-                    self.nodes[node]["closed"] = True
-                    break
-                yield (c64, str(node), mode)
-
-    # ---- feedback and persistence --------------------------------------------
-
-    @staticmethod
-    def _node_sent(rec):
-        return rec["base_yes"] + rec["base_no"] + rec["adaptive_yes"] + rec["adaptive_no"]
-
-    def feed_aggregate(self, node_str, mode, probes, positives, replies, sources):
-        node = ipaddress.ip_network(node_str)
-        stem = "base" if mode == "base" else "adaptive"
-        self.nodes[node][f"{stem}_yes"] += positives
-        self.nodes[node][f"{stem}_no"] += probes - positives
-        self.sent += probes
-        self.positive_count += positives
-
-    def finish_batch(self):
-        for parent in self._completed_splits:
-            for child in self.nodes[parent]["children"]:
-                self.nodes[child]["blocked"] = False
-            self.nodes[parent]["children"] = []
-        for node in self._touched:
-            rec = self.nodes[node]
-            if rec["closed"] or rec["blocked"]:
-                continue
-            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
-                rec["closed"] = True
-                continue
-            self._heap_push(node)
-        self._touched.clear()
-        self._completed_splits.clear()
-        self.epoch += 1
-        self.cache.clear()
-
-    def adopt_manifest_actions(self, actions):
-        root_indexes = {root: index for index, root in enumerate(self.root_order)}
-        for node_str, _ in actions:
-            node = ipaddress.ip_network(node_str)
-            if node not in self.nodes:
-                parent = next(
-                    (
-                        node.supernet(new_prefix=length)
-                        for length in range(node.prefixlen - 1, -1, -1)
-                        if node.supernet(new_prefix=length) in self.nodes
-                    ),
-                    None,
-                )
-                self._activate(node, parent)
-            if node in root_indexes:
-                self.root_index = max(self.root_index, root_indexes[node] + 1)
-            self._touched.add(node)
-
-    def rebuild_after_recovery(self):
+        self.arms = self._gap_arms()
+        self.arm_next = array("Q", (start for _, start, _ in self.arms))
+        self.arm_yes = array("Q", [0]) * len(self.arms)
+        self.arm_no = array("Q", [0]) * len(self.arms)
         self.heap = []
         self.seq = 0
-        for node, rec in self.nodes.items():
-            if rec["closed"] or rec["blocked"]:
+        for index in range(len(self.arms)):
+            self._push_arm(index)
+
+        self.pending = {}
+        self.touched_arms = set()
+        self.sent = 0
+        self.positive_count = 0
+
+    @staticmethod
+    def _c64_bounds(prefix):
+        start = int(prefix.network_address) >> 64
+        return start, start + (1 << (64 - prefix.prefixlen))
+
+    @staticmethod
+    def _c48_bounds(prefix):
+        start = int(prefix.network_address) >> 80
+        return start, start + (1 << (48 - prefix.prefixlen))
+
+    def _cover_segments(self):
+        segments = []
+        for prefix in self.frame.prefixes:
+            if prefix.prefixlen < 48:
                 continue
-            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
+            start, stop = self._c64_bounds(prefix)
+            exclusions = [
+                self._c64_bounds(child)
+                for child in self.frame.children.get(prefix, ())
+            ]
+            for gap_start, gap_stop in _gaps(start, stop, exclusions):
+                segments.append((prefix, gap_start, gap_stop))
+        segments.sort(key=lambda item: (-item[0].prefixlen, item[1]))
+        return segments
+
+    def _deep_union(self):
+        intervals = sorted((start, stop) for _, start, stop in self.cover_segments)
+        merged = []
+        for start, stop in intervals:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(stop, merged[-1][1]))
+            else:
+                merged.append((start, stop))
+        return merged, [start for start, _ in merged]
+
+    def _gap_arms(self):
+        arms = []
+        for prefix in self.frame.prefixes:
+            if prefix.prefixlen >= 48:
                 continue
-            self._heap_push(node)
+            start, stop = self._c48_bounds(prefix)
+            exclusions = [
+                self._c48_bounds(child)
+                for child in self.frame.children.get(prefix, ())
+                if child.prefixlen < 48
+            ]
+            for gap_start, gap_stop in _gaps(start, stop, exclusions):
+                arms.append((prefix, gap_start, gap_stop))
+        arms.sort(key=lambda item: (-item[0].prefixlen, item[1]))
+        return arms
+
+    def _arm_score(self, index):
+        alpha = self.prior_strength / 2 + self.arm_yes[index]
+        beta = self.prior_strength / 2 + self.arm_no[index]
+        probability = alpha / (alpha + beta)
+        information = (
+            _entropy(probability)
+            - probability * _entropy((alpha + 1) / (alpha + beta + 1))
+            - (1 - probability) * _entropy(alpha / (alpha + beta + 1))
+        )
+        owner = self.arms[index][0]
+        bgp_signal = (
+            owner.prefixlen / 48
+            + math.log1p(self.frame.descendants[owner] + 1)
+            / math.log1p(len(self.frame.prefixes) + 1)
+        ) / 2
+        return probability + self.info_weight * information + self.bgp_weight * bgp_signal
+
+    def _push_arm(self, index):
+        if self.arm_next[index] >= self.arms[index][2]:
+            return
+        heapq.heappush(self.heap, (-self._arm_score(index), self.seq, index))
+        self.seq += 1
+
+    def _pop_arm(self):
+        while self.heap:
+            _, _, index = heapq.heappop(self.heap)
+            if self.arm_next[index] < self.arms[index][2]:
+                return index
+        return None
+
+    def _covered_by_deep_bgp(self, c64):
+        position = bisect.bisect_right(self.deep_starts, c64) - 1
+        return position >= 0 and c64 < self.deep_intervals[position][1]
+
+    def _next_cover(self):
+        while self.cover_index < len(self.cover_segments):
+            owner, start, stop = self.cover_segments[self.cover_index]
+            if self.cover_cursor < start:
+                self.cover_cursor = start
+            if self.cover_cursor < stop:
+                c64 = self.cover_cursor
+                self.cover_cursor += 1
+                return c64, owner
+            self.cover_index += 1
+            if self.cover_index < len(self.cover_segments):
+                self.cover_cursor = self.cover_segments[self.cover_index][1]
+        return None
+
+    @staticmethod
+    def _c48_network(c48):
+        return ipaddress.ip_network((c48 << 80, 48))
+
+    def iter_targets(self, limit):
+        emitted = 0
+        while emitted < limit:
+            target = self._next_cover()
+            if target is None:
+                break
+            c64, owner = target
+            emitted += 1
+            yield c64, str(owner), "bgp_cover"
+        if emitted or self.cover_index < len(self.cover_segments):
+            return
+
+        while limit - emitted >= FULL_C48:
+            arm = self._pop_arm()
+            if arm is None:
+                return
+            c48 = self.arm_next[arm]
+            self.arm_next[arm] += 1
+            node = self._c48_network(c48)
+            self.pending[str(node)] = arm
+            start = c48 << 16
+            action_probes = 0
+            for c64 in range(start, start + FULL_C48):
+                if self._covered_by_deep_bgp(c64):
+                    continue
+                action_probes += 1
+                emitted += 1
+                yield c64, str(node), "bgp_gap_cover"
+            if action_probes == 0:
+                self.pending.pop(str(node), None)
+                self._push_arm(arm)
+
+    def feed_aggregate(self, node_str, mode, probes, positives, replies, sources):
+        self.sent += probes
+        self.positive_count += positives
+        if mode != "bgp_gap_cover":
+            return
+        if node_str not in self.pending:
+            raise ValueError(f"missing journal /48 action state for {node_str}")
+        arm = self.pending.pop(node_str)
+        self.arm_yes[arm] += positives
+        self.arm_no[arm] += probes - positives
+        self.touched_arms.add(arm)
+
+    def finish_batch(self):
+        for arm in self.touched_arms:
+            self._push_arm(arm)
+        self.touched_arms.clear()
+
+    def adopt_manifest_actions(self, actions):
+        raise ValueError(
+            "this journal strategy requires prepared-state.pkl.gz for scanned-batch recovery"
+        )
+
+    def rebuild_after_recovery(self):
+        return
 
     def snapshot(self):
         return {
-            "nodes": {
-                str(p): {
-                    "parent": str(rec["parent"]) if rec["parent"] else None,
-                    "quota": rec["quota"],
-                    "root": str(rec["root"]),
-                    "base_yes": rec["base_yes"],
-                    "base_no": rec["base_no"],
-                    "adaptive_yes": rec["adaptive_yes"],
-                    "adaptive_no": rec["adaptive_no"],
-                    "closed": rec["closed"],
-                    "blocked": rec["blocked"],
-                    "children": [str(child) for child in rec["children"]],
-                    "bgp_signal": rec["bgp_signal"],
-                    "nearest_bgp_length": rec["nearest_bgp_length"],
-                }
-                for p, rec in self.nodes.items()
-            },
+            "journal_state_version": STATE_VERSION,
+            "cover_index": self.cover_index,
+            "cover_cursor": self.cover_cursor,
+            "arm_next": list(self.arm_next),
+            "arm_yes": list(self.arm_yes),
+            "arm_no": list(self.arm_no),
+            "heap": [list(entry) for entry in self.heap],
+            "seq": self.seq,
+            "pending": dict(self.pending),
+            "touched_arms": sorted(self.touched_arms),
             "sent": self.sent,
             "positive_count": self.positive_count,
-            "root_index": self.root_index,
-            "epoch": self.epoch,
-            "heap": [[score, seq, str(node)] for score, seq, node in self.heap],
-            "seq": self.seq,
-            "touched": [str(node) for node in self._touched],
-            "completed_splits": [str(node) for node in self._completed_splits],
         }
 
     def checkpoint(self):
-        """Return live node state for bounded-overhead checkpoint serialization."""
         return {
-            "native": True,
-            "nodes": self.nodes,
-            "sent": self.sent,
-            "positive_count": self.positive_count,
-            "root_index": self.root_index,
-            "epoch": self.epoch,
+            "journal_state_version": STATE_VERSION,
+            "cover_index": self.cover_index,
+            "cover_cursor": self.cover_cursor,
+            "arm_next": self.arm_next,
+            "arm_yes": self.arm_yes,
+            "arm_no": self.arm_no,
             "heap": self.heap,
             "seq": self.seq,
-            "touched": self._touched,
-            "completed_splits": self._completed_splits,
+            "pending": self.pending,
+            "touched_arms": self.touched_arms,
+            "sent": self.sent,
+            "positive_count": self.positive_count,
         }
 
     def restore(self, state):
-        if state.get("native"):
-            self.nodes = state["nodes"]
-            self.sent = state["sent"]
-            self.positive_count = state["positive_count"]
-            self.root_index = state["root_index"]
-            self.epoch = state["epoch"]
-            self.heap = state["heap"]
-            self.seq = state["seq"]
-            self._touched = state["touched"]
-            self._completed_splits = state.get("completed_splits", set())
-            self.cache = {}
-            return
-        self.nodes = {
-            ipaddress.ip_network(p): {
-                "parent": ipaddress.ip_network(rec["parent"]) if rec["parent"] else None,
-                "root": ipaddress.ip_network(rec["root"]),
-                "quota": rec["quota"],
-                "base_yes": rec["base_yes"],
-                "base_no": rec["base_no"],
-                "adaptive_yes": rec["adaptive_yes"],
-                "adaptive_no": rec["adaptive_no"],
-                "closed": rec["closed"],
-                "blocked": rec.get("blocked", False),
-                "children": [ipaddress.ip_network(child) for child in rec.get("children", [])],
-                "bgp_signal": rec.get("bgp_signal", 0.0),
-                "nearest_bgp_length": rec.get("nearest_bgp_length"),
-                "heap_score": None,
-            }
-            for p, rec in state["nodes"].items()
-        }
+        if state.get("journal_state_version") != STATE_VERSION:
+            raise ValueError(
+                "journal strategy changed; start a new run with a new output_root"
+            )
+        arm_next = array("Q", state["arm_next"])
+        arm_yes = array("Q", state["arm_yes"])
+        arm_no = array("Q", state["arm_no"])
+        if not len(self.arms) == len(arm_next) == len(arm_yes) == len(arm_no):
+            raise ValueError("journal checkpoint does not match the current BGP frame")
+        self.cover_index = state["cover_index"]
+        self.cover_cursor = state["cover_cursor"]
+        self.arm_next = arm_next
+        self.arm_yes = arm_yes
+        self.arm_no = arm_no
+        self.heap = [tuple(entry) for entry in state["heap"]]
+        heapq.heapify(self.heap)
+        self.seq = state["seq"]
+        self.pending = dict(state.get("pending", {}))
+        self.touched_arms = set(state.get("touched_arms", ()))
         self.sent = state["sent"]
         self.positive_count = state["positive_count"]
-        self.root_index = state["root_index"]
-        self.epoch = state["epoch"]
-        self.cache = {}
-        self.heap = [
-            (score, seq, ipaddress.ip_network(node))
-            for score, seq, node in state.get("heap", [])
-        ]
-        self.seq = state.get("seq", 0)
-        self._touched = {ipaddress.ip_network(node) for node in state.get("touched", [])}
-        self._completed_splits = {
-            ipaddress.ip_network(node) for node in state.get("completed_splits", [])
-        }
-        if "heap" in state:
-            for score, _, node in self.heap:
-                self.nodes[node]["heap_score"] = -score
-            heapq.heapify(self.heap)
-            return
-        for node, rec in self.nodes.items():
-            if rec["closed"]:
-                continue
-            if node.prefixlen == 64 and self._node_sent(rec) >= rec["quota"]:
-                continue
-            self._heap_push(node)
