@@ -9,9 +9,10 @@ import os
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 
 from parse_results import RAW_FIELDS, parse_int, response_class, timing_ms
-from parquet_io import StringParquetWriter, iter_parquet_rows
+from parquet_io import StringParquetWriter, iter_table_file
 
 
 PROBE_FIELDS = [
@@ -132,7 +133,8 @@ def main(argv=None):
         planned = positives = multi = cross_class = 0
         probe_writer = StringParquetWriter(args.probes, PROBE_FIELDS)
         router_writer = StringParquetWriter(args.routers, ROUTER_FIELDS)
-        for row in iter_parquet_rows(args.manifest):
+        manifest_path = Path(args.manifest)
+        for row in iter_table_file(manifest_path, manifest_path.with_suffix(".csv")):
             planned += 1
             target_number = ipv6_int(row["target_ipv6"])
             target = str(ipaddress.IPv6Address(target_number))

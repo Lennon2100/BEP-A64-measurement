@@ -9,22 +9,19 @@ stored.
 import argparse
 import csv
 import gzip
-import io
 import json
 import tarfile
 from pathlib import Path
 
-from parquet_io import iter_parquet_rows
+from parquet_io import iter_archive_table
 
 
 def planned_probes(method_dir):
     """Yield `is_observed_positive` for each planned target, in send order."""
     for archive in sorted(method_dir.glob("batch-*.tar.gz")):
         with tarfile.open(archive, "r:gz") as bundle:
-            with bundle.extractfile("probes.parquet") as raw:
-                data = raw.read()
-        for row in iter_parquet_rows(io.BytesIO(data)):
-            yield row["is_observed_positive"] == "1"
+            for row in iter_archive_table(bundle, "probes.parquet", "probes.csv"):
+                yield row["is_observed_positive"] == "1"
 
 
 def cost_curve(method_dir, summary, interval):

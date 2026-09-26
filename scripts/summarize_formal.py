@@ -19,7 +19,7 @@ import json
 import tarfile
 from pathlib import Path
 
-from parquet_io import iter_parquet_rows
+from parquet_io import iter_archive_table
 
 
 def load_archives(method_dir):
@@ -34,11 +34,14 @@ def response_composition(archives):
     cross_class = 0
     for archive in archives:
         with tarfile.open(archive, "r:gz") as bundle:
-            try:
-                member = bundle.getmember("probes.parquet.summary.json")
-            except KeyError:
+            names = bundle.getnames()
+            member_name = next(
+                (name for name in ("probes.parquet.summary.json", "probes.csv.summary.json") if name in names),
+                None,
+            )
+            if member_name is None:
                 continue
-            with bundle.extractfile(member) as raw:
+            with bundle.extractfile(member_name) as raw:
                 summary = json.load(io.TextIOWrapper(raw, encoding="utf-8"))
         for cls, count in summary.get("response_class_counts", {}).items():
             classes[cls] = classes.get(cls, 0) + count
@@ -61,18 +64,12 @@ def budget_by_prefixlen(archives):
     positives = {}    # prefixlen -> positives
     for archive in archives:
         with tarfile.open(archive, "r:gz") as bundle:
-            try:
-                member = bundle.getmember("feedback.parquet")
-            except KeyError:
-                continue
-            with bundle.extractfile(member) as raw:
-                data = raw.read()
-        for row in iter_parquet_rows(io.BytesIO(data)):
-            length = ipaddress.ip_network(row["node"]).prefixlen
-            mode = row["mode"]
-            probes.setdefault(length, {}).setdefault(mode, 0)
-            probes[length][mode] += int(row["probes"])
-            positives[length] = positives.get(length, 0) + int(row["positives"])
+            for row in iter_archive_table(bundle, "feedback.parquet", "feedback.csv"):
+                length = ipaddress.ip_network(row["node"]).prefixlen
+                mode = row["mode"]
+                probes.setdefault(length, {}).setdefault(mode, 0)
+                probes[length][mode] += int(row["probes"])
+                positives[length] = positives.get(length, 0) + int(row["positives"])
     return {"probes": probes, "positives": positives}
 
 

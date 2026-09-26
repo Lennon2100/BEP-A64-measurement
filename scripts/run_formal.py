@@ -34,7 +34,12 @@ except ImportError:  # Windows development host; formal runs use Linux.
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from strategies.common import Targets
-from parquet_io import StringParquetWriter, iter_parquet_rows
+from parquet_io import (
+    StringParquetWriter,
+    iter_archive_table,
+    iter_parquet_rows,
+    iter_table_file,
+)
 
 STOP_REQUESTED = False
 MANIFEST_FIELDS = ["probe_id", "node", "mode", "c64", "target_ipv6"]
@@ -155,11 +160,10 @@ def load_recovered_targets(output, targets):
     for batch_number in recovery_batches:
         archive = output / f"batch-{batch_number:09d}.tar.gz"
         with tarfile.open(archive, "r:gz") as bundle:
-            with bundle.extractfile("manifest.parquet") as raw:
-                c64_values = [
-                    int(ipaddress.ip_network(row["c64"]).network_address) >> 64
-                    for row in iter_parquet_rows(io.BytesIO(raw.read()))
-                ]
+            c64_values = [
+                int(ipaddress.ip_network(row["c64"]).network_address) >> 64
+                for row in iter_archive_table(bundle, "manifest.parquet", "manifest.csv")
+            ]
         c64_values.sort()
         targets.add_recovered(c64_values, batch_number, reseed=False)
 
@@ -219,7 +223,7 @@ def adopt_scanned_manifest(folder, batch_number, context):
     c64_values = []
     actions = []
     seen_actions = set()
-    for row in iter_parquet_rows(folder / "manifest.parquet"):
+    for row in iter_table_file(folder / "manifest.parquet", folder / "manifest.csv"):
         c64_values.append(int(ipaddress.ip_network(row["c64"]).network_address) >> 64)
         action = (row["node"], row["mode"])
         if action not in seen_actions:
@@ -306,8 +310,12 @@ def run_method(config_path, method, resume=False):
             if work != [expected_work]:
                 raise ValueError("expected exactly the next unfinished batch work directory")
             scan_artifacts = ("raw-zmap.csv", "scan.log", "scan-complete")
-            if (
+            has_manifest = (
                 (expected_work / "manifest.parquet").is_file()
+                or (expected_work / "manifest.csv").is_file()
+            )
+            if (
+                has_manifest
                 and (expected_work / "sent-targets.txt").is_file()
                 and not any((expected_work / name).exists() for name in scan_artifacts)
             ):
@@ -319,11 +327,20 @@ def run_method(config_path, method, resume=False):
                 work = []
         if work:
             expected_work = work[0]
-            required = ("manifest.parquet", "raw-zmap.csv", "scan.log")
+            required = ("raw-zmap.csv", "scan.log")
             if any(not (expected_work / name).is_file() for name in required):
                 raise ValueError("unfinished batch has no complete scan evidence; inspect it manually")
+            has_manifest = (
+                (expected_work / "manifest.parquet").is_file()
+                or (expected_work / "manifest.csv").is_file()
+            )
+            if not has_manifest:
+                raise ValueError("unfinished batch has no manifest; inspect it manually")
             scan_completed = (expected_work / "scan-complete").is_file()
-            legacy_parser_started = (expected_work / "probes.parquet").is_file()
+            legacy_parser_started = (
+                (expected_work / "probes.parquet").is_file()
+                or (expected_work / "probes.csv").is_file()
+            )
             if not scan_completed and not legacy_parser_started:
                 raise ValueError("unfinished batch has no completed-scan marker; inspect it manually")
             prepared_path = expected_work / "prepared-state.pkl.gz"
