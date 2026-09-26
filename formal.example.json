@@ -6,11 +6,7 @@
     "frame_exclusions": "config/frame_exclusions.txt"
   },
   "seed": "replace-with-a-run-specific-seed",
-  "measurement_identity": {
-    "notice_url": "https://example.org/ipv6-measurement",
-    "operator_contact": "research@example.org"
-  },
-  "budget_total_per_method": 5000000000,
+  "budget_total_per_method": 15000000000,
   "batch_size": 1000000,
   "slow_au_threshold_ms": 1000,
   "scanner": {

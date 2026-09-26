@@ -18,6 +18,13 @@ Each command runs independently with its own budget, target history, strategy
 state, and output directory. The methods share the scanner, parser, discovery
 rule, archive format, and budget accounting.
 
+## Related Repositories & Projects
+
+- [ZMap](https://github.com/tumi8/zmap)
+- [ICMPv6 Destination Reachable](https://github.com/sbaresearch/icmpv6-destination-reachable)
+- [IPv6 Hitlist Service](https://ipv6hitlist.github.io/)
+- [SubRecon](https://github.com/THUNAME/SubRecon)
+
 ## Requirements
 
 - Linux measurement host
@@ -59,12 +66,6 @@ The command extracts and builds the scanner at:
 ```text
 .build/zmap-build/src/zmap
 ```
-
-The vendored archive comes from
-[`sbaresearch/icmpv6-destination-reachable`](https://github.com/sbaresearch/icmpv6-destination-reachable),
-file `measurements/zmap_versions/aim_zmap_reqnr_single.zip`. The build script
-applies the source edits needed by current CMake toolchains, IPv6 IP-layer
-transmission, and the request-number output field.
 
 ### 2. Prepare RIPE RIS prefixes
 
@@ -110,8 +111,6 @@ Edit these fields:
 
 | Field | Purpose |
 | --- | --- |
-| `measurement_identity.notice_url` | Public HTTPS page describing the measurement and opt-out process |
-| `measurement_identity.operator_contact` | Monitored operator email address |
 | `scanner.source_ipv6` | IPv6 address assigned to the measurement host |
 | `scanner.interface` | Outgoing interface |
 | `scanner.gateway_mac` | Gateway MAC, or `-` for an IP-layer tunnel |
@@ -121,15 +120,6 @@ Edit these fields:
 | `batch_size` | Probes sent before strategy feedback |
 | `output_root` | New run directory |
 | `seed` | Run-specific target seed |
-
-The runner requires a real HTTPS notice URL and operator address before a new
-scan starts. The complete configuration is copied into the run directory.
-
-Validate the JSON syntax:
-
-```bash
-python3 -m json.tool experiment.json >/dev/null
-```
 
 ### 4. Run a method
 
@@ -169,7 +159,7 @@ sudo .venv/bin/python scripts/run_formal.py \
 
 An interruption before packet transmission leaves an unscanned work directory;
 resume discards it and regenerates the batch. A completed scan is parsed and
-archived without sending the targets again.
+archived directly from its existing output.
 
 ### 6. Analyze completed runs
 
@@ -203,28 +193,6 @@ observed when the response matches either:
 The outer source address of a matched Address Unreachable response is saved as
 a last-hop router-interface observation.
 
-## Measurement ethics
-
-Complete these steps before raising the scan rate:
-
-1. Obtain written authorization from the measurement host and network operator.
-2. Publish an HTTPS measurement notice with a valid public TLS certificate. It
-   should state the project purpose, source addresses, protocols, schedule,
-   packet rate, contact address, and opt-out procedure.
-3. Point reverse DNS for the source address to the notice domain when the
-   network operator supports it.
-4. Monitor the published contact address throughout the run.
-5. Add opt-out and local exclusion prefixes to `config/frame_exclusions.txt`
-   before starting each method.
-6. Start at a low rate, watch host and network load, and raise the rate in
-   controlled steps.
-7. Stop affected traffic when an operator reports harm or requests exclusion,
-   then update the exclusion file before starting a new run.
-
-The strategy loader applies the exclusion file before target generation. The
-runner prevents repeated `/64` targets within each method and records the
-notice URL and operator contact in the run configuration.
-
 ## Output and recovery
 
 The active batch is stored as `batch-NNNNNNNNN.work`. After parsing, the runner
@@ -240,17 +208,17 @@ Each archive contains:
 - post-batch strategy state.
 
 Tables use Parquet and raw scanner output remains CSV. Target generation and
-table writing are streamed. Resume loads the latest checkpoint and does not
-replay all completed probe rows.
+table writing are streamed. Resume loads the latest checkpoint and continues
+from the saved batch boundary.
 
 At rate `R`, transmitting `B` probes takes approximately `B / R` seconds.
 Cooldown, parsing, compression, and downtime add to the total. Run a small
-authorized pilot to choose a batch size that fits the host's memory and disk.
+pilot to choose a batch size that fits the host's memory and disk.
 
 ## Repository layout
 
 ```text
-config/                 Prefix exclusions and opt-outs
+config/                 Prefix exclusions
 scripts/                BGP preparation, scanning, parsing, and analysis
 strategies/             Pluggable target-generation methods
 vendor/                 Scanner source archive
@@ -271,5 +239,27 @@ A strategy module under `strategies/` provides:
 - `Strategy.checkpoint()`
 - `Strategy.restore(state)`
 
-The runner imports the module named on the command line. Adding another method
-does not require scanner changes.
+The runner imports the module named on the command line, so new methods plug
+into the existing scanner.
+
+## Data Open Source Notice
+
+This notice applies to measurement datasets released with this project.
+
+### Usage Restrictions
+
+The data may be used only for academic research. Commercial use, data resale,
+commercial product development, profit-making analysis, and distribution to
+commercial institutions require prior written permission.
+
+### Liability Statement
+
+We may terminate data access and pursue legal remedies when a user violates
+the academic-use terms. Data users assume responsibility for their use of the
+data and any consequences arising from that use. For questions or permission
+requests, contact [liaoyuxuan@nudt.edu.cn](mailto:liaoyuxuan@nudt.edu.cn).
+
+## License
+
+The source code is licensed under the [Apache License 2.0](LICENSE). The data
+notice above governs measurement datasets released with the project.
