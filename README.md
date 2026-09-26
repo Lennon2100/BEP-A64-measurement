@@ -50,7 +50,7 @@ response labels or an external Hitlist. `scripts/run_formal.py` runs one method 
 - `scripts/run_formal.py`: the formal scan/parse loop with streaming target
   generation and compact cursor/node checkpoints (no archive replay).
 - `scripts/analyze_formal.py`: derives per-method cost/discovery curves from
-  each batch's `probes.csv`; no separate per-target ledger file is stored.
+  each batch's `probes.parquet`; no separate per-target ledger file is stored.
 
 `scripts/analyze_campaign.py` already aggregates the D050 reference labels and
 calibration results. The formal runner writes per-method cumulative cost and
@@ -141,9 +141,12 @@ the implemented threshold `1 / 2^(64-prefix_length)`. Use a new campaign and
 output directory if this explicit interpretation changes.
 
 Each completed batch is one `batch-000000001.tar.gz` archive containing a
-single `manifest.csv` (the ordered target table plus `node`/`mode`), scanner
-command and version, raw ZMap CSV, compact parsed per-probe evidence, node
-feedback, matched AU router observations, and the post-batch checkpoint. The temporary `.work`
+single `manifest.parquet` (the ordered target table plus `node`/`mode`),
+scanner command and version, raw ZMap CSV, compact parsed per-probe Parquet
+evidence, node feedback, matched AU router observations, and the post-batch
+checkpoint. All derived tables are Parquet (`manifest.parquet`,
+`probes.parquet`, `feedback.parquet`, `last-hop-router-observations.parquet`);
+only ZMap's raw output stays CSV. The temporary `.work`
 directory is removed only after the archive has been written and read back.
 Compression temporarily needs space for both the working batch and its
 archive. A `.tar.gz.part` blocks automatic resume. A `.work` directory with
@@ -182,7 +185,7 @@ source diversity and response coverage. Its external Hitlist expansion phase
 is omitted. When present, native comparator prefixes are written to
 `native-prefixes.txt.gz` separately from the common positive `/64` count.
 `analyze_formal.py` derives `comparison.csv` and `cost-discovery-curve.csv.gz`
-from each batch's `probes.csv`.
+from each batch's `probes.parquet`.
 
 TNet reports `candidate_screen`, `uniform`, and `adaptive` stages. Every target
 in all three stages is emitted through the same runner and charged once against
@@ -192,11 +195,13 @@ CSV.
 
 ## Linux build
 
-On Debian/Ubuntu, install the upstream build dependencies:
+On Debian/Ubuntu, install the upstream build dependencies plus the Python
+Parquet library used by the formal runner/parser/analyzer:
 
 ```bash
 sudo apt-get install build-essential cmake libgmp-dev gengetopt \
   libpcap-dev flex byacc libjson-c-dev pkg-config libunistring-dev unzip patch
+python3 -m pip install pyarrow
 chmod +x scripts/*.sh
 ./scripts/build_zmap.sh
 ```

@@ -10,7 +10,6 @@ loads that checkpoint without replaying historical probe rows.
 """
 
 import argparse
-import csv
 import gzip
 import importlib
 import io
@@ -35,19 +34,20 @@ except ImportError:  # Windows development host; formal runs use Linux.
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from strategies.common import Targets
+from parquet_io import StringParquetWriter, iter_parquet_rows
 
 STOP_REQUESTED = False
 MANIFEST_FIELDS = ["probe_id", "node", "mode", "c64", "target_ipv6"]
 ARCHIVE_FILES = (
-    "manifest.csv",
+    "manifest.parquet",
     "raw-zmap.csv",
     "raw-zmap.csv.command.txt",
     "raw-zmap.csv.scanner-version.txt",
     "scan.log",
-    "probes.csv",
-    "probes.csv.summary.json",
-    "feedback.csv",
-    "last-hop-router-observations.csv",
+    "probes.parquet",
+    "probes.parquet.summary.json",
+    "feedback.parquet",
+    "last-hop-router-observations.parquet",
 )
 CHECKPOINT_NAME = "state.pkl.gz"
 
@@ -155,21 +155,23 @@ def load_recovered_targets(output, targets):
     for batch_number in recovery_batches:
         archive = output / f"batch-{batch_number:09d}.tar.gz"
         with tarfile.open(archive, "r:gz") as bundle:
-            with bundle.extractfile("manifest.csv") as raw:
-                reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8", newline=""))
-                c64_values = [int(ipaddress.ip_network(row["c64"]).network_address) >> 64 for row in reader]
+            with bundle.extractfile("manifest.parquet") as raw:
+                c64_values = [
+                    int(ipaddress.ip_network(row["c64"]).network_address) >> 64
+                    for row in iter_parquet_rows(io.BytesIO(raw.read()))
+                ]
         c64_values.sort()
         targets.add_recovered(c64_values, batch_number, reseed=False)
 
 
 def parse_scanned_batch(folder, context):
-    parsed = folder / "probes.csv"
-    feedback = folder / "feedback.csv"
-    router_obs = folder / "last-hop-router-observations.csv"
+    parsed = folder / "probes.parquet"
+    feedback = folder / "feedback.parquet"
+    router_obs = folder / "last-hop-router-observations.parquet"
     for path in (parsed, Path(str(parsed) + ".summary.json"), feedback, router_obs):
         path.unlink(missing_ok=True)
     subprocess.run(
-        [sys.executable, str(context.parser), str(folder / "manifest.csv"),
+        [sys.executable, str(context.parser), str(folder / "manifest.parquet"),
          str(folder / "raw-zmap.csv"), str(parsed), str(feedback), str(router_obs),
          "--slow-au-threshold-ms", str(context.threshold)],
         check=True, stdout=subprocess.DEVNULL, start_new_session=True,
@@ -177,23 +179,21 @@ def parse_scanned_batch(folder, context):
 
 
 def apply_batch_feedback(folder, context):
-    router_obs = folder / "last-hop-router-observations.csv"
+    router_obs = folder / "last-hop-router-observations.parquet"
     feed_router = getattr(context.strategy, "feed_router_observation", None)
-    with open(router_obs, newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
-            router = int(ipaddress.IPv6Address(row["router_ipv6"]))
-            context.routers.add(router)
-            if feed_router is not None:
-                feed_router(row["c64"], router)
+    for row in iter_parquet_rows(router_obs):
+        router = int(ipaddress.IPv6Address(row["router_ipv6"]))
+        context.routers.add(router)
+        if feed_router is not None:
+            feed_router(row["c64"], router)
     feed_class = getattr(context.strategy, "feed_class_aggregate", None)
-    with open(folder / "feedback.csv", newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
-            if feed_class is not None:
-                feed_class(row)
-            context.strategy.feed_aggregate(
-                row["node"], row["mode"], int(row["probes"]),
-                int(row["positives"]), int(row["replies"]), json.loads(row["sources"]),
-            )
+    for row in iter_parquet_rows(folder / "feedback.parquet"):
+        if feed_class is not None:
+            feed_class(row)
+        context.strategy.feed_aggregate(
+            row["node"], row["mode"], int(row["probes"]),
+            int(row["positives"]), int(row["replies"]), json.loads(row["sources"]),
+        )
     context.strategy.finish_batch()
 
 
@@ -219,14 +219,13 @@ def adopt_scanned_manifest(folder, batch_number, context):
     c64_values = []
     actions = []
     seen_actions = set()
-    with open(folder / "manifest.csv", newline="", encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
-            c64_values.append(int(ipaddress.ip_network(row["c64"]).network_address) >> 64)
-            action = (row["node"], row["mode"])
-            if action not in seen_actions:
-                actions.append(action)
-                seen_actions.add(action)
-            context.stages[row["mode"]] += 1
+    for row in iter_parquet_rows(folder / "manifest.parquet"):
+        c64_values.append(int(ipaddress.ip_network(row["c64"]).network_address) >> 64)
+        action = (row["node"], row["mode"])
+        if action not in seen_actions:
+            actions.append(action)
+            seen_actions.add(action)
+        context.stages[row["mode"]] += 1
     if not c64_values:
         raise ValueError("unfinished manifest is empty")
     c64_values.sort()
@@ -308,7 +307,7 @@ def run_method(config_path, method, resume=False):
                 raise ValueError("expected exactly the next unfinished batch work directory")
             scan_artifacts = ("raw-zmap.csv", "scan.log", "scan-complete")
             if (
-                (expected_work / "manifest.csv").is_file()
+                (expected_work / "manifest.parquet").is_file()
                 and (expected_work / "sent-targets.txt").is_file()
                 and not any((expected_work / name).exists() for name in scan_artifacts)
             ):
@@ -320,11 +319,11 @@ def run_method(config_path, method, resume=False):
                 work = []
         if work:
             expected_work = work[0]
-            required = ("manifest.csv", "raw-zmap.csv", "scan.log")
+            required = ("manifest.parquet", "raw-zmap.csv", "scan.log")
             if any(not (expected_work / name).is_file() for name in required):
                 raise ValueError("unfinished batch has no complete scan evidence; inspect it manually")
             scan_completed = (expected_work / "scan-complete").is_file()
-            legacy_parser_started = (expected_work / "probes.csv").is_file()
+            legacy_parser_started = (expected_work / "probes.parquet").is_file()
             if not scan_completed and not legacy_parser_started:
                 raise ValueError("unfinished batch has no completed-scan marker; inspect it manually")
             prepared_path = expected_work / "prepared-state.pkl.gz"
@@ -366,18 +365,17 @@ def run_method(config_path, method, resume=False):
         archive = output / f"{round_name}.tar.gz"
         folder.mkdir()
 
-        manifest = folder / "manifest.csv"
+        manifest = folder / "manifest.parquet"
         sent = folder / "sent-targets.txt"
         raw = folder / "raw-zmap.csv"
 
         # Stream target generation; no in-memory batch lists.
         count = 0
-        with open(manifest, "w", newline="", encoding="utf-8") as mf, open(sent, "w", encoding="utf-8") as sf:
-            writer = csv.DictWriter(mf, fieldnames=MANIFEST_FIELDS)
-            writer.writeheader()
+        manifest_writer = StringParquetWriter(manifest, MANIFEST_FIELDS)
+        with open(sent, "w", encoding="utf-8") as sf:
             for index, (c64, node, mode) in enumerate(strategy.iter_targets(limit)):
                 address = targets.address(c64)
-                writer.writerow({
+                manifest_writer.write({
                     "probe_id": f"{method}:{round_name}:{index}",
                     "node": node, "mode": mode,
                     "c64": str(ipaddress.ip_network((c64 << 64, 64))),
@@ -386,6 +384,7 @@ def run_method(config_path, method, resume=False):
                 sf.write(address + "\n")
                 stage_counts[mode] += 1
                 count += 1
+        manifest_writer.close()
 
         log_memory(f"after generating batch {batch_number}")
 

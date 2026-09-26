@@ -11,6 +11,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 from parse_results import RAW_FIELDS, parse_int, response_class, timing_ms
+from parquet_io import StringParquetWriter, iter_parquet_rows
 
 
 PROBE_FIELDS = [
@@ -129,91 +130,83 @@ def main(argv=None):
         statuses = Counter()
         classes = Counter()
         planned = positives = multi = cross_class = 0
-        with open(args.manifest, newline="", encoding="utf-8") as mf, \
-             open(args.probes, "w", newline="", encoding="utf-8") as pf, \
-             open(args.routers, "w", newline="", encoding="utf-8") as rf:
-            reader = csv.DictReader(mf)
-            required = {"probe_id", "node", "mode", "c64", "target_ipv6"}
-            if required - set(reader.fieldnames or ()):
-                raise ValueError("formal manifest is missing required fields")
-            probe_writer = csv.DictWriter(pf, fieldnames=PROBE_FIELDS)
-            router_writer = csv.DictWriter(rf, fieldnames=ROUTER_FIELDS)
-            probe_writer.writeheader()
-            router_writer.writeheader()
-            for row in reader:
-                planned += 1
-                target_number = ipv6_int(row["target_ipv6"])
-                target = str(ipaddress.IPv6Address(target_number))
-                found = responses.pop(target_number, None)
-                if found:
-                    cross_class += found.class_mask.bit_count() > 1
-                    # One sent target is one budget item.  Prefer the first
-                    # positive arrival when any response satisfies the IMC
-                    # rule; otherwise retain the first arrival.  The raw CSV
-                    # remains the complete multi-response evidence.
-                    rtt, cls, source, raw_line = found.representative
-                    multi += found.count > 1
-                    status = "matched"
-                    positive = int(found.positive)
-                else:
-                    source = rtt = raw_line = None
-                    status, cls, positive = "timeout", "timeout", 0
-                key = (row["node"], row["mode"])
-                aggregate = feedback[key]
-                aggregate["probes"] += 1
-                aggregate["positives"] += positive
-                aggregate["replies"] += bool(found and found.reply)
-                if found and found.class_mask & CLASS_BITS["slow_au"]:
-                    aggregate["bep_active"] += 1
-                elif found and found.class_mask & (
-                    CLASS_BITS["fast_au"] | CLASS_BITS["tx"] | CLASS_BITS["rr"]
+        probe_writer = StringParquetWriter(args.probes, PROBE_FIELDS)
+        router_writer = StringParquetWriter(args.routers, ROUTER_FIELDS)
+        for row in iter_parquet_rows(args.manifest):
+            planned += 1
+            target_number = ipv6_int(row["target_ipv6"])
+            target = str(ipaddress.IPv6Address(target_number))
+            found = responses.pop(target_number, None)
+            if found:
+                cross_class += found.class_mask.bit_count() > 1
+                # One sent target is one budget item.  Prefer the first
+                # positive arrival when any response satisfies the IMC
+                # rule; otherwise retain the first arrival.  The raw CSV
+                # remains the complete multi-response evidence.
+                rtt, cls, source, raw_line = found.representative
+                multi += found.count > 1
+                status = "matched"
+                positive = int(found.positive)
+            else:
+                source = rtt = raw_line = None
+                status, cls, positive = "timeout", "timeout", 0
+            key = (row["node"], row["mode"])
+            aggregate = feedback[key]
+            aggregate["probes"] += 1
+            aggregate["positives"] += positive
+            aggregate["replies"] += bool(found and found.reply)
+            if found and found.class_mask & CLASS_BITS["slow_au"]:
+                aggregate["bep_active"] += 1
+            elif found and found.class_mask & (
+                CLASS_BITS["fast_au"] | CLASS_BITS["tx"] | CLASS_BITS["rr"]
+            ):
+                aggregate["bep_inactive"] += 1
+            else:
+                aggregate["bep_null"] += 1
+            for router, observation in (found.au_sources or {}).items() if found else ():
+                router_text = str(ipaddress.IPv6Address(router))
+                router_rtt, router_class, router_line = observation
+                # TNet consumes candidate-screen router evidence from the
+                # streamed observation file. Avoid duplicating millions of
+                # one-shot router values in its node feedback aggregate.
+                if (
+                    row["mode"] != "candidate_screen"
+                    and not row["mode"].startswith("conference_")
                 ):
-                    aggregate["bep_inactive"] += 1
-                else:
-                    aggregate["bep_null"] += 1
-                for router, observation in (found.au_sources or {}).items() if found else ():
-                    router_text = str(ipaddress.IPv6Address(router))
-                    router_rtt, router_class, router_line = observation
-                    # TNet consumes candidate-screen router evidence from the
-                    # streamed observation file. Avoid duplicating millions of
-                    # one-shot router values in its node feedback aggregate.
-                    if (
-                        row["mode"] != "candidate_screen"
-                        and not row["mode"].startswith("conference_")
-                    ):
-                        aggregate["sources"].add(router_text)
-                    router_writer.writerow({
-                        "probe_id": row["probe_id"], "c64": row["c64"],
-                        "target_ipv6": target, "router_ipv6": router_text,
-                        "response_class": router_class,
-                        "rtt_ms": f"{router_rtt:.3f}",
-                        "raw_row_number": router_line,
-                    })
-                positives += positive
-                statuses[status] += 1
-                classes[cls] += 1
-                probe_writer.writerow({
-                    "probe_id": row["probe_id"], "node": row["node"],
-                    "mode": row["mode"], "c64": row["c64"],
-                    "target_ipv6": target, "match_status": status,
-                    "response_class": cls, "is_observed_positive": positive,
-                    "icmp_source": str(ipaddress.IPv6Address(source)) if source is not None else "",
-                    "rtt_ms": f"{rtt:.3f}" if rtt is not None else "",
-                    "raw_row_number": raw_line if raw_line is not None else "",
+                    aggregate["sources"].add(router_text)
+                router_writer.write({
+                    "probe_id": row["probe_id"], "c64": row["c64"],
+                    "target_ipv6": target, "router_ipv6": router_text,
+                    "response_class": router_class,
+                    "rtt_ms": f"{router_rtt:.3f}",
+                    "raw_row_number": router_line,
                 })
+            positives += positive
+            statuses[status] += 1
+            classes[cls] += 1
+            probe_writer.write({
+                "probe_id": row["probe_id"], "node": row["node"],
+                "mode": row["mode"], "c64": row["c64"],
+                "target_ipv6": target, "match_status": status,
+                "response_class": cls, "is_observed_positive": positive,
+                "icmp_source": str(ipaddress.IPv6Address(source)) if source is not None else "",
+                "rtt_ms": f"{rtt:.3f}" if rtt is not None else "",
+                "raw_row_number": raw_line if raw_line is not None else "",
+            })
+        probe_writer.close()
+        router_writer.close()
 
-        with open(args.feedback, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=FEEDBACK_FIELDS)
-            writer.writeheader()
-            for (node, mode), item in feedback.items():
-                writer.writerow({
-                    "node": node, "mode": mode, "probes": item["probes"],
-                    "positives": item["positives"], "replies": item["replies"],
-                    "sources": json.dumps(sorted(item["sources"])),
-                    "bep_active": item["bep_active"],
-                    "bep_inactive": item["bep_inactive"],
-                    "bep_null": item["bep_null"],
-                })
+        feedback_writer = StringParquetWriter(args.feedback, FEEDBACK_FIELDS)
+        for (node, mode), item in feedback.items():
+            feedback_writer.write({
+                "node": node, "mode": mode, "probes": item["probes"],
+                "positives": item["positives"], "replies": item["replies"],
+                "sources": json.dumps(sorted(item["sources"])),
+                "bep_active": item["bep_active"],
+                "bep_inactive": item["bep_inactive"],
+                "bep_null": item["bep_null"],
+            })
+        feedback_writer.close()
         summary = {
             "planned_probe_count": planned, "raw_response_count": raw_count,
             "invalid_raw_row_count": invalid_count,

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Combine completed strategy runs into cost and discovery tables.
 
-The cost curve is derived from each batch's `probes.csv` (parsed rows are in
-manifest order and carry `is_observed_positive`); no separate ledger file is
+The cost curve is derived from each batch's `probes.parquet` (parsed rows are
+in manifest order and carry `is_observed_positive`); no separate ledger file is
 stored.
 """
 
@@ -14,15 +14,17 @@ import json
 import tarfile
 from pathlib import Path
 
+from parquet_io import iter_parquet_rows
+
 
 def planned_probes(method_dir):
     """Yield `is_observed_positive` for each planned target, in send order."""
     for archive in sorted(method_dir.glob("batch-*.tar.gz")):
         with tarfile.open(archive, "r:gz") as bundle:
-            with bundle.extractfile("probes.csv") as raw:
-                reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8", newline=""))
-                for row in reader:
-                    yield row["is_observed_positive"] == "1"
+            with bundle.extractfile("probes.parquet") as raw:
+                data = raw.read()
+        for row in iter_parquet_rows(io.BytesIO(data)):
+            yield row["is_observed_positive"] == "1"
 
 
 def cost_curve(method_dir, summary, interval):

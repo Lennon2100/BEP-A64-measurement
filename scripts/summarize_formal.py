@@ -13,12 +13,13 @@ figure/table inputs (Table III response composition, Fig. 4b budget placement).
 """
 
 import argparse
-import csv
 import io
 import ipaddress
 import json
 import tarfile
 from pathlib import Path
+
+from parquet_io import iter_parquet_rows
 
 
 def load_archives(method_dir):
@@ -34,7 +35,7 @@ def response_composition(archives):
     for archive in archives:
         with tarfile.open(archive, "r:gz") as bundle:
             try:
-                member = bundle.getmember("probes.csv.summary.json")
+                member = bundle.getmember("probes.parquet.summary.json")
             except KeyError:
                 continue
             with bundle.extractfile(member) as raw:
@@ -61,17 +62,17 @@ def budget_by_prefixlen(archives):
     for archive in archives:
         with tarfile.open(archive, "r:gz") as bundle:
             try:
-                member = bundle.getmember("feedback.csv")
+                member = bundle.getmember("feedback.parquet")
             except KeyError:
                 continue
             with bundle.extractfile(member) as raw:
-                reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8"))
-                for row in reader:
-                    length = ipaddress.ip_network(row["node"]).prefixlen
-                    mode = row["mode"]
-                    probes.setdefault(length, {}).setdefault(mode, 0)
-                    probes[length][mode] += int(row["probes"])
-                    positives[length] = positives.get(length, 0) + int(row["positives"])
+                data = raw.read()
+        for row in iter_parquet_rows(io.BytesIO(data)):
+            length = ipaddress.ip_network(row["node"]).prefixlen
+            mode = row["mode"]
+            probes.setdefault(length, {}).setdefault(mode, 0)
+            probes[length][mode] += int(row["probes"])
+            positives[length] = positives.get(length, 0) + int(row["positives"])
     return {"probes": probes, "positives": positives}
 
 

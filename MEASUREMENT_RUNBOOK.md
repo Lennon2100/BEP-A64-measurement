@@ -104,7 +104,7 @@ python3 scripts/analyze_formal.py formal-v2.json
 
 此前缺少 `summary.json` 是方法未完成的后续现象；分析器不绕过这个条件。
 
-同一目标可能收到多条甚至跨类别响应。正式 parser 保留完整 raw CSV，每个目标仍只计一次预算；只要任一匹配响应满足 IMC 规则，该 `/64` 就记为阳性。紧凑 `probes.csv` 选择第一条阳性到达（没有阳性时选择第一条到达），所有 AU 响应源均写入末跳证据，summary 记录多响应与跨类别目标数。
+同一目标可能收到多条甚至跨类别响应。正式 parser 保留完整 raw CSV，每个目标仍只计一次预算；只要任一匹配响应满足 IMC 规则，该 `/64` 就记为阳性。紧凑 `probes.parquet` 选择第一条阳性到达（没有阳性时选择第一条到达），所有 AU 响应源均写入末跳证据，summary 记录多响应与跨类别目标数。
 
 需要暂停时，对 runner 发送一次 SIGINT（Ctrl+C）或 SIGTERM，等待当前批次扫描、解析、压缩完成并输出 `status: paused`。随后分别使用各自原配置续跑：
 
@@ -115,20 +115,20 @@ sudo python3 scripts/run_formal.py tnet.json tnet --resume
 sudo python3 scripts/run_formal.py bep-conference.json bep_conference --resume
 ```
 
-若 ZMap 已完成但 parser 失败，保留对应的下一批 `.work`。旧 `.work` 没有生成后 checkpoint 时，`--resume` 以其已发送 manifest 为事实，登记该批 `/64` 为恢复排除项，应用已有 raw 反馈并归档，不再次调用 ZMap。新批次在发包前写 `prepared-state.pkl.gz`，以后同类失败可直接恢复生成后状态。若目录只有 `manifest.csv` 和 `sent-targets.txt`、完全没有扫描产物，说明中断发生在发包前；`--resume` 会删除并重新生成这一批。
+若 ZMap 已完成但 parser 失败，保留对应的下一批 `.work`。旧 `.work` 没有生成后 checkpoint 时，`--resume` 以其已发送 manifest 为事实，登记该批 `/64` 为恢复排除项，应用已有 raw 反馈并归档，不再次调用 ZMap。新批次在发包前写 `prepared-state.pkl.gz`，以后同类失败可直接恢复生成后状态。若目录只有 `manifest.parquet` 和 `sent-targets.txt`、完全没有扫描产物，说明中断发生在发包前；`--resume` 会删除并重新生成这一批。
 
 续跑兼容读取旧归档的 `state.json`，新归档使用流式写入的 `state.pkl.gz`（紧凑节点聚合、前沿状态与置换游标），**不重放历史逐探针记录**。运行状态为 O(已筛选节点)，写检查点不复制完整节点图或构造完整 JSON 字符串。批后检查点先写入批目录、再随批归档，归档是唯一原子提交点。
 
-每个完成批次保存为 `batch-000000001.tar.gz` 等压缩包，内含唯一且保持发送顺序的 `manifest.csv`、实际命令、扫描器版本、原始 ZMap CSV、紧凑逐探针证据、节点级反馈、末跳源地址证据、批后 `state.pkl.gz` 和日志。临时 `sent-targets.txt` 与 manifest 的 `target_ipv6` 列重复，扫描结束后即删除。压缩包写完并读回后，runner 删除对应 `.work/`；压缩期间磁盘要同时容纳该批原文件和压缩包。有扫描产物但证据不完整的 `.work/` 仍要求人工核对，避免重发。
+每个完成批次保存为 `batch-000000001.tar.gz` 等压缩包，内含唯一且保持发送顺序的 `manifest.parquet`、实际命令、扫描器版本、原始 ZMap CSV、紧凑逐探针 `probes.parquet`、节点级 `feedback.parquet`、末跳源地址证据、批后 `state.pkl.gz` 和日志。所有派生表均为 Parquet（`manifest/probes/feedback/last-hop-router-observations`），仅 ZMap 的 raw 输出保持 CSV。临时 `sent-targets.txt` 与 manifest 的 `target_ipv6` 列重复，扫描结束后即删除。压缩包写完并读回后，runner 删除对应 `.work/`；压缩期间磁盘要同时容纳该批原文件和压缩包。有扫描产物但证据不完整的 `.work/` 仍要求人工核对，避免重发。
 
 ## 输出与比较
 
-每方法完成后写 `summary.json`、`last-hop-routers.txt.gz` 和按需生成的 `native-prefixes.txt.gz`。末跳列表记录去重后的候选接口地址，不是经过独立核验的路由器设备数。分析器从各批 `probes.csv` 派生 `comparison.csv` 与 `cost-discovery-curve.csv.gz`，不再存逐探针台账文件。`formal_sent` 与 `distinct_new_positive_c64` 统计本次成功完成扫描批次中的目标（每个 `/64` 最多一发，故阳性探针数即不同阳性 `/64` 数），不包含任何历史探针。
+每方法完成后写 `summary.json`、`last-hop-routers.txt.gz` 和按需生成的 `native-prefixes.txt.gz`。末跳列表记录去重后的候选接口地址，不是经过独立核验的路由器设备数。分析器从各批 `probes.parquet` 派生 `comparison.csv` 与 `cost-discovery-curve.csv.gz`，不再存逐探针台账文件。`formal_sent` 与 `distinct_new_positive_c64` 统计本次成功完成扫描批次中的目标（每个 `/64` 最多一发，故阳性探针数即不同阳性 `/64` 数），不包含任何历史探针。
 
 ## 磁盘增长估算（每批 B 个探针、全程 T 个探针）
 
-- 工作目录单批仍由 `manifest.csv`、`probes.csv` 与原始 ZMap CSV 主导；按当前短字段预计未压缩约 0.3–0.6 KB/探针，压缩比必须以首个真实批次实测，不能把估算当容量保证。
-- 全程磁盘是 O(T) 的原始证据归档；`state.pkl.gz` 为 O(已筛选节点)。若压缩后为 0.05–0.15 KB/探针，T=10^8 约 5–15 GB，T=5×10^9 约 250–750 GB；正式 5B 前必须按真实首批压缩率确认外置存储和迁出流程。
+- 工作目录单批由 `manifest.parquet`、`probes.parquet` 与原始 ZMap CSV 主导；Parquet 本身已列式压缩，单批磁盘占用远小于 CSV 文本，但仍须以首个真实批次实测，不能把估算当容量保证。
+- 全程磁盘是 O(T) 的原始证据归档；`state.pkl.gz` 为 O(已筛选节点)。若 Parquet 归档约 0.05–0.15 KB/探针，T=10^8 约 5–15 GB，T=5×10^9 约 250–750 GB；正式 5B 前必须按真实首批压缩率确认外置存储和迁出流程。
 
 ## 旧运行目录的安全处理
 
