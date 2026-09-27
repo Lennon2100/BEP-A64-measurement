@@ -18,6 +18,7 @@ import ipaddress
 import random
 from array import array
 from collections import defaultdict
+from dataclasses import dataclass
 
 from scripts.prefix_data import (
     build_immediate_parent_map,
@@ -76,13 +77,20 @@ class Frame:
         return cls(prefixes, {})
 
 
+@dataclass(slots=True)
+class Position:
+    offset: int
+    stride: int
+    cursor: int = 0
+
+
 class Targets:
     """Deterministic, resume-compatible /64 target generator with exact dedup."""
 
     def __init__(self, seed):
         self.seed = seed
         self.rng = random.Random(seed)
-        self.positions = {}        # prefix -> [offset, stride, cursor]
+        self.positions = {}        # prefix -> Position
         self.recovered = array("Q")  # sorted exceptional legacy-recovery /64s
         self.recovery_batches = []
 
@@ -91,7 +99,7 @@ class Targets:
         if prefix not in self.positions:
             offset = self.rng.randrange(count)
             stride = 1 if count == 1 else 2 * self.rng.randrange(count // 2) + 1
-            self.positions[prefix] = [offset, stride, 0]
+            self.positions[prefix] = Position(offset, stride)
         return self.positions[prefix]
 
     def was_drawn(self, prefix, c64):
@@ -104,9 +112,9 @@ class Targets:
         if not 0 <= relative < count:
             return False
         index = 0 if count == 1 else (
-            (relative - position[0]) * pow(position[1], -1, count)
+            (relative - position.offset) * pow(position.stride, -1, count)
         ) % count
-        return index < position[2]
+        return index < position.cursor
 
     def drawn_values(self, prefix):
         """Yield the /64 indices covered before this node's saved cursor."""
@@ -115,8 +123,8 @@ class Targets:
             return
         count = 1 << (64 - prefix.prefixlen)
         start = int(prefix.network_address) >> 64
-        for index in range(position[2]):
-            yield start + ((position[0] + position[1] * index) % count)
+        for index in range(position.cursor):
+            yield start + ((position.offset + position.stride * index) % count)
 
     def prior_count(self, prefix, ancestors):
         """Count distinct earlier targets inside a newly activated descendant."""
@@ -136,9 +144,9 @@ class Targets:
         count = 1 << (64 - prefix.prefixlen)
         start = int(prefix.network_address) >> 64
         position = self._position(prefix)
-        while position[2] < count:
-            value = start + ((position[0] + position[1] * position[2]) % count)
-            position[2] += 1
+        while position.cursor < count:
+            value = start + ((position.offset + position.stride * position.cursor) % count)
+            position.cursor += 1
             recovered_at = bisect.bisect_left(self.recovered, value)
             was_recovered = recovered_at < len(self.recovered) and self.recovered[recovered_at] == value
             if not was_recovered and not any(self.was_drawn(ancestor, value) for ancestor in ancestors):
@@ -149,12 +157,18 @@ class Targets:
         iid = self.rng.randrange(1, 1 << 64)
         return str(ipaddress.IPv6Address((c64 << 64) | iid))
 
+    def forget(self, prefix):
+        self.positions.pop(prefix, None)
+
     def snapshot(self):
         """Compact generator state: RNG plus one permutation cursor per node."""
         return {
             "seed": self.seed,
             "rng": self.rng.getstate(),
-            "positions": {str(p): list(v) for p, v in self.positions.items()},
+            "positions": {
+                str(prefix): [position.offset, position.stride, position.cursor]
+                for prefix, position in self.positions.items()
+            },
             "recovery_batches": self.recovery_batches,
         }
 
@@ -173,7 +187,11 @@ class Targets:
             raise ValueError("target generator seed mismatch")
         if state.get("native"):
             self.rng.setstate(state["rng"])
-            self.positions = state["positions"]
+            positions = state["positions"]
+            if positions and not isinstance(next(iter(positions.values())), Position):
+                for prefix, position in positions.items():
+                    positions[prefix] = Position(*position)
+            self.positions = positions
             self.recovered = array("Q")
             self.recovery_batches = state.get("recovery_batches", [])
             return
@@ -182,7 +200,8 @@ class Targets:
 
         self.rng.setstate(tuples(state["rng"]))
         self.positions = {
-            ipaddress.ip_network(p): list(v) for p, v in state["positions"].items()
+            ipaddress.ip_network(prefix): Position(*position)
+            for prefix, position in state["positions"].items()
         }
         self.recovered = array("Q")
         self.recovery_batches = list(state.get("recovery_batches", []))

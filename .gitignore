@@ -20,3 +20,5 @@ project_memory/
 
 # Local experiment configuration
 campaign.json
+curve.csv
+scripts/plot_curve.py
